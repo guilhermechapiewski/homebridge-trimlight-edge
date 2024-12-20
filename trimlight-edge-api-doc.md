@@ -1,3 +1,5 @@
+(Original documentation)[https://39877180.fs1.hubspotusercontent-na1.net/hubfs/39877180/Manuals/Trimlight_Edge_API_Documentation%208192022.pdf]
+
 # Trimlight V2 OAuth API Documentation
 
 ## 1. Auth
