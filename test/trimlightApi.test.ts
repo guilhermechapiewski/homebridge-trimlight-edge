@@ -241,6 +241,16 @@ describe('TrimlightClient', () => {
     });
   });
 
+  it('sends currentDate as wall-clock time in the configured time zone', async () => {
+    const now = new Date(Date.UTC(2026, 9, 29, 3, 20, 21));
+    server.handler = () => ({ body: { code: 0, payload: {} } });
+    await client({ now: () => now, timeZone: 'America/Los_Angeles' }).getDeviceDetail('abc');
+    await client({ now: () => now, timeZone: 'America/Los_Angeles' }).notifyUpdateShadow('abc');
+    const expected = { year: 26, month: 10, day: 28, weekday: 4, hours: 20, minutes: 20, seconds: 21 };
+    expect((server.requests[0].body as { currentDate: unknown }).currentDate).toEqual(expected);
+    expect((server.requests[1].body as { currentDate: unknown }).currentDate).toEqual(expected);
+  });
+
   describe('notifyUpdateShadow', () => {
     it('sends the device id and current date', async () => {
       const now = new Date(2025, 0, 2, 3, 4, 5);

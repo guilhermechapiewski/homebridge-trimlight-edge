@@ -4,6 +4,7 @@ import https from 'https';
 import { URL } from 'url';
 
 import type { CalendarSchedule, DailySchedule } from './schedule';
+import { wallClock, Zone } from './timeZone';
 
 export const DEFAULT_BASE_URL = 'https://trimlight.ledhue.com/trimlight';
 
@@ -45,6 +46,8 @@ export interface TrimlightDeviceDetail {
   connectivity?: number;
   daily?: DailySchedule[];
   calendar?: CalendarSchedule[];
+  /** The controller's own clock (its local wall time) as last reported. */
+  currentDatetime?: TrimlightDate;
   [key: string]: unknown;
 }
 
@@ -95,6 +98,11 @@ export interface TrimlightClientOptions {
   retryBaseDelayMs?: number;
   /** Clock used for signatures and `currentDate`; injectable for tests. */
   now?: () => Date;
+  /**
+   * IANA time zone of the house (e.g. "America/Los_Angeles"). `currentDate`
+   * is sent as wall-clock time in this zone; defaults to the host's zone.
+   */
+  timeZone?: string;
   /** Optional debug logger. Never receives the client secret. */
   debug?: (message: string) => void;
 }
@@ -173,6 +181,7 @@ export class TrimlightClient {
   private readonly maxAttempts: number;
   private readonly retryBaseDelayMs: number;
   private readonly now: () => Date;
+  private readonly timeZone?: string;
   private readonly debug: (message: string) => void;
 
   private queueTail: Promise<void> = Promise.resolve();
@@ -192,6 +201,7 @@ export class TrimlightClient {
     this.maxAttempts = Math.max(1, options.maxAttempts ?? 3);
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 500;
     this.now = options.now ?? (() => new Date());
+    this.timeZone = options.timeZone;
     this.debug = options.debug ?? (() => undefined);
   }
 
@@ -206,10 +216,10 @@ export class TrimlightClient {
   }
 
   /** Returns the full device detail (switch state, effects, schedules, ...). */
-  async getDeviceDetail(deviceId: string): Promise<TrimlightDeviceDetail> {
+  async getDeviceDetail(deviceId: string, zone?: Zone): Promise<TrimlightDeviceDetail> {
     const payload = await this.request<TrimlightDeviceDetail>('POST', 'v1/oauth/resources/device/get', {
       deviceId,
-      currentDate: toTrimlightDate(this.now()),
+      currentDate: this.currentDate(zone),
     });
     if (typeof payload !== 'object' || payload === null) {
       throw new TrimlightApiError('Unexpected device detail response: missing payload');
@@ -229,15 +239,23 @@ export class TrimlightClient {
    * Asks the controller to report its latest state to the cloud so the next
    * read is fresh. Best-effort: single attempt, errors are swallowed.
    */
-  async notifyUpdateShadow(deviceId: string): Promise<void> {
+  async notifyUpdateShadow(deviceId: string, zone?: Zone): Promise<void> {
     try {
       await this.request('GET', 'v1/oauth/resources/device/notify-update-shadow', {
         deviceId,
-        currentDate: toTrimlightDate(this.now()),
+        currentDate: this.currentDate(zone),
       }, 1);
     } catch (error) {
       this.debug(`notify-update-shadow failed for ${deviceId}: ${(error as Error).message}`);
     }
+  }
+
+  /**
+   * Wall-clock "now" in the API's format, in `zone` (the controller's known
+   * zone), else the configured time zone, else host local time.
+   */
+  private currentDate(zone?: Zone): TrimlightDate {
+    return toTrimlightDate(wallClock(this.now(), zone ?? this.timeZone));
   }
 
   private async request<T>(method: 'GET' | 'POST', path: string, body: unknown, attempts = this.maxAttempts): Promise<T | undefined> {

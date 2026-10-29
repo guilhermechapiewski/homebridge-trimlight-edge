@@ -1,6 +1,7 @@
 import type { API, CharacteristicValue, Logger, PlatformAccessory, Service } from 'homebridge';
 
 import { isScheduleLit } from './schedule';
+import { formatOffset, wallClock, Zone } from './timeZone';
 import { SwitchState, TrimlightDevice, TrimlightDeviceDetail } from './trimlightApi';
 
 export type ExposeAs = 'lightbulb' | 'switch';
@@ -21,7 +22,21 @@ export interface TrimlightAccessoryContext {
    * changes made in the Trimlight app.
    */
   commandedState?: number;
+  /**
+   * The controller clock's offset from UTC in minutes, learned from the clock
+   * it reports. Schedules run on this clock. Persisted so it survives restarts.
+   */
+  clockOffsetMinutes?: number;
 }
+
+/** Offsets beyond this (minutes) aren't real time zones. */
+const MAX_OFFSET_MINUTES = 14 * 60;
+/** A reading must sit this close (minutes) to a 15-minute zone offset. */
+const OFFSET_ALIGNMENT_MINUTES = 2;
+/** Two readings at least this far apart (ms) are needed to trust the clock. */
+const CLOCK_CONFIRM_GAP_MS = 60_000;
+/** ...and the controller clock must have advanced in step within this (ms). */
+const CLOCK_TICK_TOLERANCE_MS = 30_000;
 
 export interface TrimlightAccessoryDeps {
   api: API;
@@ -41,6 +56,11 @@ export interface TrimlightAccessoryDeps {
   requestRefresh?: (force?: boolean) => Promise<void>;
   /** How often to re-evaluate schedules locally; 0 disables (tests). */
   clockTickMs?: number;
+  /**
+   * IANA time zone configured by the user. Overrides the zone learned from the
+   * controller's clock; with neither, the host's zone is used.
+   */
+  timeZone?: string;
   now?: () => number;
 }
 
@@ -49,14 +69,15 @@ const DEFAULT_COMMAND_COOLDOWN_MS = 10_000;
 /**
  * Whether the lights are actually lit. Timer mode is resolved against the
  * schedules (assuming lit when they can't tell); an unknown state reads as off.
+ * Schedules are wall-clock times in `zone` (default: the host's zone).
  */
-export function isLit(state: DeviceState, now: Date): boolean {
+export function isLit(state: DeviceState, now: Date, zone?: Zone): boolean {
   switch (state.switchState) {
     case undefined:
     case SwitchState.Off:
       return false;
     case SwitchState.Timer:
-      return isScheduleLit(state, now) ?? true;
+      return isScheduleLit(state, wallClock(now, zone)) ?? true;
     default:
       return true;
   }
@@ -87,6 +108,9 @@ export class TrimlightAccessory {
   private ignorePollsUntil = 0;
   private restoringSchedule = false;
   private clockTimer?: NodeJS.Timeout;
+  private confirmTimer?: NodeJS.Timeout;
+  /** Last controller clock reading: its wall time (as UTC ms) and when we saw it. */
+  private clockSample?: { controllerMs: number; at: number };
 
   constructor(
     private readonly deps: TrimlightAccessoryDeps,
@@ -100,7 +124,7 @@ export class TrimlightAccessory {
     if (device.switchState === SwitchState.Timer) {
       accessory.context.followsSchedule = true;
     }
-    this.on = isLit(device, new Date(this.now()));
+    this.on = this.litNow(device);
     this.online = device.connectivity === 1;
 
     const info = accessory.getService(S.AccessoryInformation) ?? accessory.addService(S.AccessoryInformation);
@@ -130,6 +154,10 @@ export class TrimlightAccessory {
       .onGet(this.handleGet.bind(this))
       .onSet(this.handleSet.bind(this));
 
+    if (this.online) {
+      this.service.updateCharacteristic(C.On, this.on);
+    }
+
     const tickMs = deps.clockTickMs ?? 60_000;
     if (tickMs > 0) {
       this.clockTimer = setInterval(() => this.checkClock(), tickMs);
@@ -137,11 +165,85 @@ export class TrimlightAccessory {
     }
   }
 
+  /**
+   * The zone schedules are evaluated in: the configured time zone, else the
+   * controller's learned clock offset, else host local time.
+   */
+  get zone(): Zone | undefined {
+    return this.deps.timeZone || this.accessory.context.clockOffsetMinutes;
+  }
+
+  /** "Now" as wall-clock time on the controller's clock. */
+  private wallNow(): Date {
+    return wallClock(new Date(this.now()), this.zone);
+  }
+
+  private litNow(state: DeviceState): boolean {
+    return isLit(state, new Date(this.now()), this.zone);
+  }
+
+  /**
+   * Learns the controller clock's offset from a clock reading in the device
+   * detail (`controllerMs` = its local wall time, encoded as if it were UTC).
+   *
+   * The cloud can serve a frozen, days-old reading, so the offset is only
+   * trusted when two readings at least a minute apart show the clock ticking
+   * in step with real time, and the offset is a plausible zone offset.
+   */
+  observeControllerClock(controllerMs: number, at = this.now()): void {
+    if (this.deps.timeZone) {
+      return;
+    }
+    const previous = this.clockSample;
+    this.clockSample = { controllerMs, at };
+
+    const diffMinutes = (controllerMs - at) / 60_000;
+    const offset = Math.round(diffMinutes / 15) * 15;
+    const plausible = Math.abs(diffMinutes - offset) <= OFFSET_ALIGNMENT_MINUTES && Math.abs(offset) <= MAX_OFFSET_MINUTES;
+
+    if (!previous || at - previous.at < CLOCK_CONFIRM_GAP_MS) {
+      // Take a second reading a bit later to confirm the clock is live.
+      if (plausible && this.accessory.context.clockOffsetMinutes !== offset) {
+        this.scheduleClockConfirmation();
+      }
+      return;
+    }
+    const ticking = Math.abs((controllerMs - previous.controllerMs) - (at - previous.at)) <= CLOCK_TICK_TOLERANCE_MS;
+    if (!plausible || !ticking) {
+      this.deps.log.debug(`${this.accessory.displayName}: ignoring a stale or implausible controller clock reading`);
+      return;
+    }
+    if (this.accessory.context.clockOffsetMinutes !== offset) {
+      const previousOffset = this.accessory.context.clockOffsetMinutes;
+      this.accessory.context.clockOffsetMinutes = offset;
+      this.deps.log.info(previousOffset === undefined
+        ? `${this.accessory.displayName}: following the controller's clock (${formatOffset(offset)}) for schedules`
+        : `${this.accessory.displayName}: the controller's clock changed to ${formatOffset(offset)}`);
+      this.persist();
+      this.setOn(this.litNow(this.accessory.context.device));
+    }
+  }
+
+  private scheduleClockConfirmation(): void {
+    if (this.confirmTimer || !this.deps.requestRefresh) {
+      return;
+    }
+    this.confirmTimer = setTimeout(() => {
+      this.confirmTimer = undefined;
+      void this.deps.requestRefresh?.(true);
+    }, CLOCK_CONFIRM_GAP_MS + 5_000);
+    this.confirmTimer.unref?.();
+  }
+
   /** Stops the local clock tick (accessory removed or Homebridge shutting down). */
   dispose(): void {
     if (this.clockTimer) {
       clearInterval(this.clockTimer);
       this.clockTimer = undefined;
+    }
+    if (this.confirmTimer) {
+      clearTimeout(this.confirmTimer);
+      this.confirmTimer = undefined;
     }
   }
 
@@ -155,7 +257,7 @@ export class TrimlightAccessory {
     if (this.now() < this.ignorePollsUntil) {
       return;
     }
-    this.setOn(isLit(this.accessory.context.device, new Date(this.now())));
+    this.setOn(this.litNow(this.accessory.context.device));
     if (this.restoreDue()) {
       if (this.deps.requestRefresh) {
         void this.deps.requestRefresh(true);
@@ -182,7 +284,7 @@ export class TrimlightAccessory {
     } else {
       this.accessory.context.device = device;
       this.trackMode(device.switchState);
-      this.setOn(isLit(device, new Date(this.now())), false);
+      this.setOn(this.litNow(device), false);
       this.restoreScheduleIfWindowOver();
     }
     this.updateFirmware(device);
@@ -243,7 +345,7 @@ export class TrimlightAccessory {
     if (turnOn) {
       target = SwitchState.Manual;
       description = `Turning ${name} on`;
-    } else if (context.followsSchedule && isScheduleLit(context.device, new Date(this.now())) === false) {
+    } else if (context.followsSchedule && isScheduleLit(context.device, this.wallNow()) === false) {
       // Outside its schedule windows timer mode is dark, so going straight
       // back to it turns the lights off without dropping the schedule.
       target = SwitchState.Timer;
@@ -317,7 +419,7 @@ export class TrimlightAccessory {
         // Skip if a newer command superseded the "off" while this was in flight.
         if (context.commandedState === SwitchState.Off) {
           this.applyCommandedState(SwitchState.Timer);
-          this.on = isLit(context.device, new Date(this.now()));
+          this.on = this.litNow(context.device);
           this.deps.log.info(`${name}: schedule window over, timer schedule restored`);
         }
       })
@@ -334,7 +436,7 @@ export class TrimlightAccessory {
     const context = this.accessory.context;
     return !!context.followsSchedule && context.commandedState === SwitchState.Off
       && context.device.switchState === SwitchState.Off && this.online && !this.restoringSchedule
-      && isScheduleLit(context.device, new Date(this.now())) === false;
+      && isScheduleLit(context.device, this.wallNow()) === false;
   }
 
   private applyCommandedState(target: SwitchState): void {

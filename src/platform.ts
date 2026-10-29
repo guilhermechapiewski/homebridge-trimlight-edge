@@ -11,7 +11,8 @@ import {
   POLL_RETRY_INITIAL_MS,
 } from './settings';
 import { DeviceState, ExposeAs, sanitizeName, TrimlightAccessory, TrimlightAccessoryContext } from './trimlightAccessory';
-import { TrimlightAuthError, TrimlightClient, TrimlightDevice } from './trimlightApi';
+import { TrimlightAuthError, TrimlightClient, TrimlightDate, TrimlightDevice } from './trimlightApi';
+import { hostTimeZone, isUtcZone, isValidTimeZone } from './timeZone';
 
 export interface TrimlightPlatformConfig {
   clientId: string;
@@ -19,6 +20,8 @@ export interface TrimlightPlatformConfig {
   /** Background check interval; 0 means only at startup and on demand. */
   pollingIntervalSeconds: number;
   exposeAs: ExposeAs;
+  /** IANA time zone of the house; undefined means the host's zone. */
+  timeZone?: string;
   /** Undocumented; lets tests point the plugin at a mock server. */
   baseUrl?: string;
 }
@@ -34,6 +37,18 @@ export interface PlatformTiming {
 type Client = Pick<TrimlightClient, 'listDevices' | 'getDeviceDetail' | 'setSwitchState' | 'notifyUpdateShadow'>;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** The controller's reported wall time, encoded as if it were UTC (ms), or undefined. */
+function controllerClockMs(date: TrimlightDate | undefined): number | undefined {
+  if (!date || typeof date !== 'object') {
+    return undefined;
+  }
+  const { year, month, day, hours, minutes, seconds } = date;
+  if (![year, month, day, hours, minutes, seconds].every(Number.isInteger)) {
+    return undefined;
+  }
+  return Date.UTC(2000 + year, month - 1, day, hours, minutes, seconds);
+}
 
 /** Validates the raw Homebridge config, returning a list of problems if invalid. */
 export function parseConfig(config: PlatformConfig): TrimlightPlatformConfig | string[] {
@@ -67,6 +82,16 @@ export function parseConfig(config: PlatformConfig): TrimlightPlatformConfig | s
     }
   }
 
+  let timeZone: string | undefined;
+  if (typeof config.timezone === 'string' && config.timezone.trim()) {
+    timeZone = config.timezone.trim();
+    if (!isValidTimeZone(timeZone)) {
+      errors.push(`"timezone" "${timeZone}" is not a known time zone (use a name like "America/Los_Angeles")`);
+    }
+  } else if (config.timezone !== undefined && config.timezone !== null && config.timezone !== '') {
+    errors.push('"timezone" must be a time zone name like "America/Los_Angeles"');
+  }
+
   if (errors.length) {
     return errors;
   }
@@ -75,6 +100,7 @@ export function parseConfig(config: PlatformConfig): TrimlightPlatformConfig | s
     clientSecret,
     pollingIntervalSeconds,
     exposeAs,
+    timeZone,
     baseUrl: typeof config.baseUrl === 'string' && config.baseUrl ? config.baseUrl : undefined,
   };
 }
@@ -104,6 +130,8 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
   /** Per-device on-demand refresh bookkeeping, keyed by UUID. */
   private readonly lastRefreshAt = new Map<string, number>();
   private readonly refreshing = new Map<string, Promise<void>>();
+  /** Controller clock readings from the latest status reads, by device id. */
+  private readonly clockReadings = new Map<string, { controllerMs: number; at: number }>();
 
   constructor(
     readonly log: Logger,
@@ -113,6 +141,7 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
       clientId: settings.clientId,
       clientSecret: settings.clientSecret,
       baseUrl: settings.baseUrl,
+      timeZone: settings.timeZone,
       debug: (message) => log.debug(message),
     }),
     timing: Partial<PlatformTiming> = {},
@@ -139,7 +168,20 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
         + 'Status is also refreshed whenever the Home app shows the accessory.');
     }
 
+    // `timezone` is an undocumented override; schedules normally follow the
+    // controller's own clock, which is learned automatically.
+    if (parsed.timeZone) {
+      this.log.info(`Using time zone ${parsed.timeZone} for schedules`);
+    }
+
     this.api.on('didFinishLaunching', () => {
+      // Cached accessories are restored by now; say so once if the clock still
+      // has to be learned on a UTC host (HOOBS), where timer-mode state would
+      // otherwise briefly be evaluated in UTC.
+      const learned = [...this.accessories.values()].some((a) => a.context.clockOffsetMinutes !== undefined);
+      if (!parsed.timeZone && !learned && isUtcZone(hostTimeZone())) {
+        this.log.info("This host runs on UTC; learning the controller's clock for schedules (takes about a minute)");
+      }
       void this.poll();
     });
     this.api.on('shutdown', () => this.stop());
@@ -215,6 +257,7 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
         const state = await this.readStatus(accessory.context.device);
         if (!this.stopped && this.handlers.get(uuid) === handler) {
           handler.update(state);
+          this.deliverClockReading(state.deviceId, handler);
         }
       } catch (error) {
         this.reportPollError(error as Error);
@@ -254,12 +297,18 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
    */
   private async readStatus(base: DeviceState): Promise<DeviceState> {
     const client = this.client!;
-    await client.notifyUpdateShadow(base.deviceId);
+    // Send the date/time as the controller's own clock shows it, once known.
+    const zone = this.handlers.get(this.api.hap.uuid.generate(base.deviceId))?.zone ?? this.settings?.timeZone;
+    await client.notifyUpdateShadow(base.deviceId, zone);
     if (this.timing.notifySettleMs > 0) {
       await sleep(this.timing.notifySettleMs);
     }
     try {
-      const detail = await client.getDeviceDetail(base.deviceId);
+      const detail = await client.getDeviceDetail(base.deviceId, zone);
+      const controllerMs = controllerClockMs(detail.currentDatetime);
+      if (controllerMs !== undefined) {
+        this.clockReadings.set(base.deviceId, { controllerMs, at: Date.now() });
+      }
       if (this.detailFailures.delete(base.deviceId)) {
         this.log.info(`Status of ${base.name} is available again`);
       }
@@ -312,6 +361,14 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
     this.pollTimer.unref?.();
   }
 
+  private deliverClockReading(deviceId: string, handler: TrimlightAccessory): void {
+    const reading = this.clockReadings.get(deviceId);
+    if (reading) {
+      this.clockReadings.delete(deviceId);
+      handler.observeControllerClock(reading.controllerMs, reading.at);
+    }
+  }
+
   private reportPollError(error: Error): void {
     const message = error.message;
     if (message === this.lastPollError) {
@@ -336,6 +393,7 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
       const handler = this.handlers.get(uuid);
       if (handler) {
         handler.update(device);
+        this.deliverClockReading(device.deviceId, handler);
         continue;
       }
 
@@ -343,7 +401,9 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
       if (cached) {
         this.log.info(`Restored ${cached.displayName} (${device.deviceId})`);
         cached.context.device = device;
-        this.handlers.set(uuid, this.createHandler(cached));
+        const restored = this.createHandler(cached);
+        this.handlers.set(uuid, restored);
+        this.deliverClockReading(device.deviceId, restored);
         this.api.updatePlatformAccessories([cached]);
         continue;
       }
@@ -353,7 +413,9 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
       const accessory = new this.api.platformAccessory<TrimlightAccessoryContext>(name, uuid);
       accessory.context.device = device;
       this.accessories.set(uuid, accessory);
-      this.handlers.set(uuid, this.createHandler(accessory));
+      const created = this.createHandler(accessory);
+      this.handlers.set(uuid, created);
+      this.deliverClockReading(device.deviceId, created);
       this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
     }
 
@@ -384,6 +446,7 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
       exposeAs: this.settings!.exposeAs,
       requestRefresh: (force) => this.refreshDevice(accessory.UUID, force),
       clockTickMs: this.timing.clockTickMs,
+      timeZone: this.settings!.timeZone,
     }, accessory);
   }
 }

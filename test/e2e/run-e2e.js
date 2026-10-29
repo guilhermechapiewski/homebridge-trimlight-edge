@@ -7,6 +7,8 @@
  * Usage: npm run test:e2e
  * Set HOMEBRIDGE_BIN to test a different Homebridge install (e.g. v2), and
  * E2E_PLUGIN_PATH to test an unpacked `npm pack` tarball instead of the repo.
+ * E2E_HOMEBRIDGE_TZ runs Homebridge in another time zone (e.g. "UTC", like a
+ * HOOBS box) while the mock controller's clock stays in this machine's zone.
  */
 const assert = require('assert');
 const { spawn } = require('child_process');
@@ -78,7 +80,7 @@ async function waitFor(description, predicate, timeoutMs = 30000) {
 
 function startHomebridge(storageDir, pluginDir) {
   const child = spawn(process.execPath, [HOMEBRIDGE_BIN, '-I', '-D', '-U', storageDir, '-P', pluginDir], {
-    env: { ...process.env, FORCE_COLOR: '0', DEBUG: '' },
+    env: { ...process.env, FORCE_COLOR: '0', DEBUG: '', ...(process.env.E2E_HOMEBRIDGE_TZ ? { TZ: process.env.E2E_HOMEBRIDGE_TZ } : {}) },
   });
   const proc = { child, output: '' };
   const append = (chunk) => {
@@ -165,7 +167,7 @@ async function main() {
       return hb.output.includes('Adding Front House') && (await findOnCharacteristic(hapPort).catch(() => undefined));
     });
     const versionLine = (hb.output.match(/Homebridge v\d+\.\d+\.\d+[\w.-]*/) || ['Homebridge (unknown version)'])[0];
-    console.log(`Running against ${versionLine} on Node ${process.version}`);
+    console.log(`Running against ${versionLine} on Node ${process.version}, Homebridge TZ=${process.env.E2E_HOMEBRIDGE_TZ || '(same as tests)'}`);
     step('plugin loaded and Lightbulb accessory published');
 
     const { aid, iid, accessories } = await findOnCharacteristic(hapPort);
@@ -176,6 +178,11 @@ async function main() {
     assert.strictEqual(infoValue('30'), DEVICE_ID);
     assert.strictEqual(infoValue('52'), '1.2.3');
     step('accessory information (manufacturer, serial, firmware) is correct');
+
+    // Schedules run on the controller's clock (this machine's zone in the mock),
+    // whatever zone Homebridge itself runs in.
+    await waitFor("the controller's clock to be learned", async () => /following the controller's clock \(UTC[+-]\d\d:\d\d\)/.test(hb.output), 120000);
+    step(`schedules follow the controller's clock (${(hb.output.match(/following the controller's clock \((UTC[^)]+)\)/) || [])[1]})`);
 
     assert.strictEqual((await readOn(hapPort, aid, iid)).value, false);
     step('initial state reads as off');

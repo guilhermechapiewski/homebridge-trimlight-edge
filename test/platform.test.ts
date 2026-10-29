@@ -2,6 +2,7 @@ import type { PlatformAccessory, PlatformConfig } from 'homebridge';
 import { HomebridgeAPI } from 'homebridge/lib/api';
 
 import { parseConfig, TrimlightPlatform } from '../src/platform';
+import * as timeZoneModule from '../src/timeZone';
 import { PLATFORM_NAME, PLUGIN_NAME } from '../src/settings';
 import { DeviceState, TrimlightAccessoryContext } from '../src/trimlightAccessory';
 import { SwitchState, TrimlightApiError, TrimlightAuthError, TrimlightDevice, TrimlightDeviceDetail } from '../src/trimlightApi';
@@ -25,6 +26,15 @@ describe('parseConfig', () => {
   it('allows 0 (background checks off) and raises short intervals to the 60 s minimum', () => {
     expect(parseConfig({ ...baseConfig, pollingIntervalSeconds: 0 })).toMatchObject({ pollingIntervalSeconds: 0 });
     expect(parseConfig({ ...baseConfig, pollingIntervalSeconds: 30 })).toMatchObject({ pollingIntervalSeconds: 60 });
+  });
+
+  it('accepts a valid time zone and rejects unknown ones', () => {
+    expect(parseConfig({ ...baseConfig, timezone: ' America/Los_Angeles ' })).toMatchObject({ timeZone: 'America/Los_Angeles' });
+    expect(parseConfig({ ...baseConfig, timezone: '' })).toMatchObject({ timeZone: undefined });
+    expect(parseConfig({ ...baseConfig, timezone: 'Pacific Time' })).toEqual([
+      '"timezone" "Pacific Time" is not a known time zone (use a name like "America/Los_Angeles")',
+    ]);
+    expect(parseConfig({ ...baseConfig, timezone: 7 })).toEqual(['"timezone" must be a time zone name like "America/Los_Angeles"']);
   });
 
   it('reports every problem at once', () => {
@@ -77,8 +87,12 @@ describe('TrimlightPlatform', () => {
     return accessory;
   };
 
+  let hostZone: jest.SpyInstance;
+
   beforeEach(() => {
     jest.useFakeTimers();
+    // Tests choose the host zone explicitly; the machine running them may be on UTC.
+    hostZone = jest.spyOn(timeZoneModule, 'hostTimeZone').mockReturnValue('America/Los_Angeles');
     api = new HomebridgeAPI();
     log = makeLogger();
     client = {
@@ -105,6 +119,7 @@ describe('TrimlightPlatform', () => {
   afterEach(() => {
     api.signalShutdown();
     jest.useRealTimers();
+    hostZone.mockRestore();
   });
 
   it('logs config errors and does nothing else', async () => {
@@ -469,6 +484,94 @@ describe('TrimlightPlatform', () => {
         expect(details['device-1'].switchState).toBe(SwitchState.Manual);
         expect(lightbulbOn(registered[0]).value).toBe(true);
       });
+    });
+  });
+  describe('time zones (the owner\'s HOOBS box runs on UTC)', () => {
+    const lightbulbOn = (accessory: PlatformAccessory) =>
+      accessory.getService(api.hap.Service.Lightbulb)!.getCharacteristic(api.hap.Characteristic.On);
+    const realController = () => makeDevice({
+      switchState: SwitchState.Timer,
+      daily: [{ id: 0, enable: true, effectId: 7, repetition: 1, startTime: { hours: 18, minutes: 0 }, endTime: { hours: 21, minutes: 0 } }],
+      calendar: [],
+    });
+    // The moment of the bug report: 03:20 UTC = 20:20 in Los Angeles = 12:20 in Tokyo.
+    const reportInstant = new Date(Date.UTC(2026, 9, 29, 3, 20, 21));
+
+    it('evaluates the schedule in the configured zone, not the host\'s', async () => {
+      jest.setSystemTime(reportInstant);
+      setCloud(realController());
+      await launch(createPlatform({ ...baseConfig, timezone: 'America/Los_Angeles' }));
+      expect(lightbulbOn(registered[0]).value).toBe(true);
+      expect(log.info).toHaveBeenCalledWith('Using time zone America/Los_Angeles for schedules');
+    });
+
+    it('shows dark for the same instant in a zone where the window has not started', async () => {
+      jest.setSystemTime(reportInstant);
+      setCloud(realController());
+      await launch(createPlatform({ ...baseConfig, timezone: 'Asia/Tokyo' }));
+      expect(lightbulbOn(registered[0]).value).toBe(false);
+    });
+
+    it('on a UTC host, says once that it is learning the controller clock (no warning)', async () => {
+      hostZone.mockReturnValue('Etc/UTC');
+      await launch(createPlatform());
+      expect(log.info).toHaveBeenCalledWith("This host runs on UTC; learning the controller's clock for schedules (takes about a minute)");
+      expect(log.warn).not.toHaveBeenCalled();
+    });
+
+    it('stays quiet on a UTC host once the clock was learned before a restart', async () => {
+      hostZone.mockReturnValue('Etc/UTC');
+      const platform = createPlatform();
+      const cached = cachedAccessory(makeDevice());
+      cached.context.clockOffsetMinutes = -420;
+      platform.configureAccessory(cached);
+      await launch(platform);
+      expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('learning the controller'));
+    });
+
+    it('stays quiet when the host has a real local zone', async () => {
+      await launch(createPlatform());
+      expect(log.info).not.toHaveBeenCalledWith(expect.stringContaining('learning the controller'));
+      expect(log.warn).not.toHaveBeenCalled();
+    });
+  });
+  describe('learning the time zone from the controller clock', () => {
+    it('shows the owner\'s timer schedule correctly with no time zone configured', async () => {
+      const lightbulbOn = (accessory: PlatformAccessory) =>
+        accessory.getService(api.hap.Service.Lightbulb)!.getCharacteristic(api.hap.Characteristic.On);
+      // The bug report: 03:20 UTC, controller on Pacific time (20:20), lit 18:00-21:00.
+      jest.setSystemTime(new Date(Date.UTC(2026, 9, 29, 3, 20, 21)));
+      setCloud(makeDevice({
+        switchState: SwitchState.Timer,
+        daily: [{ id: 0, enable: true, effectId: 7, repetition: 1, startTime: { hours: 18, minutes: 0 }, endTime: { hours: 21, minutes: 0 } }],
+        calendar: [],
+      }));
+      client.getDeviceDetail.mockImplementation(async (id: string) => {
+        const pdt = new Date(Date.now() - 7 * 3600_000);
+        return {
+          ...details[id],
+          currentDatetime: {
+            year: pdt.getUTCFullYear() - 2000, month: pdt.getUTCMonth() + 1, day: pdt.getUTCDate(), weekday: pdt.getUTCDay() + 1,
+            hours: pdt.getUTCHours(), minutes: pdt.getUTCMinutes(), seconds: pdt.getUTCSeconds(),
+          },
+        };
+      });
+      await launch(createPlatform());
+      expect(client.getDeviceDetail).toHaveBeenCalledTimes(1);
+
+      // The accessory asks for a confirming reading ~65 s later.
+      await jest.advanceTimersByTimeAsync(65_000);
+      expect(client.getDeviceDetail).toHaveBeenCalledTimes(2);
+      const accessory = registered[0] as PlatformAccessory<TrimlightAccessoryContext>;
+      expect(accessory.context.clockOffsetMinutes).toBe(-420);
+      expect(lightbulbOn(accessory).value).toBe(true);
+
+      // From now on, the date/time sent to Trimlight is the controller's local time.
+      await jest.advanceTimersByTimeAsync(15_000);
+      await lightbulbOn(accessory).handleGetRequest();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(client.getDeviceDetail).toHaveBeenLastCalledWith('device-1', -420);
+      expect(client.notifyUpdateShadow).toHaveBeenLastCalledWith('device-1', -420);
     });
   });
 });

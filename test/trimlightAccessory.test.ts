@@ -24,6 +24,13 @@ describe('isLit', () => {
   const evening = new Date(2026, 9, 28, 19, 0);
   const schedule = { daily: [{ enable: true, repetition: 1, startTime: { hours: 18, minutes: 0 }, endTime: { hours: 21, minutes: 0 } }] };
 
+  it('evaluates timer schedules in the given time zone', () => {
+    const instant = new Date(Date.UTC(2026, 9, 29, 3, 20));
+    const timer = makeDevice({ switchState: SwitchState.Timer, ...schedule });
+    expect(isLit(timer, instant, 'America/Los_Angeles')).toBe(true);
+    expect(isLit(timer, instant, 'UTC')).toBe(false);
+  });
+
   it.each([
     ['unknown state', { switchState: undefined }, noon, false],
     ['off', { switchState: SwitchState.Off }, evening, false],
@@ -456,6 +463,110 @@ describe('TrimlightAccessory', () => {
       } finally {
         jest.useRealTimers();
       }
+    });
+  });
+  describe('following the controller\'s clock (host on UTC, house on Pacific time)', () => {
+    const schedule = {
+      daily: [{ id: 0, enable: true, effectId: 7, repetition: 1, startTime: { hours: 18, minutes: 0 }, endTime: { hours: 21, minutes: 0 } }],
+      calendar: [],
+    };
+    // 03:20 UTC; the controller's clock (Pacific, UTC-7) reads 20:20, inside its window.
+    const instant = Date.UTC(2026, 9, 29, 3, 20, 21);
+    const pdt = (utcMs: number) => utcMs - 7 * 3600_000;
+    const timer = () => makeDevice({ switchState: SwitchState.Timer, ...schedule });
+
+    beforeEach(() => {
+      requestRefresh = jest.fn().mockResolvedValue(undefined);
+    });
+
+    it('adopts the offset after two live readings a minute apart and re-evaluates', () => {
+      clock = instant;
+      const { handler, on, accessory } = build(timer());
+      const persisted = jest.spyOn(api, 'updatePlatformAccessories');
+      handler.observeControllerClock(pdt(instant), instant);
+      expect(accessory.context.clockOffsetMinutes).toBeUndefined();
+
+      clock = instant + 65_000;
+      handler.observeControllerClock(pdt(clock), clock);
+      expect(accessory.context.clockOffsetMinutes).toBe(-420);
+      expect(handler.zone).toBe(-420);
+      expect(on.value).toBe(true);
+      expect(log.info).toHaveBeenCalledWith("Front House: following the controller's clock (UTC-07:00) for schedules");
+      expect(persisted).toHaveBeenCalledWith([accessory]);
+      persisted.mockRestore();
+    });
+
+    it('ignores a frozen (stale) clock that does not tick with real time', () => {
+      clock = instant;
+      const { handler, accessory } = build(timer());
+      const stale = pdt(instant) - 2 * 3600_000; // two hours old, frozen
+      handler.observeControllerClock(stale, instant);
+      handler.observeControllerClock(stale, instant + 65_000);
+      handler.observeControllerClock(stale, instant + 130_000);
+      expect(accessory.context.clockOffsetMinutes).toBeUndefined();
+    });
+
+    it('ignores offsets that are not real time zones', () => {
+      clock = instant;
+      const { handler, accessory } = build(timer());
+      const daysOld = instant - 2 * 24 * 3600_000; // ticking but two days behind
+      handler.observeControllerClock(daysOld, instant);
+      handler.observeControllerClock(daysOld + 65_000, instant + 65_000);
+      expect(accessory.context.clockOffsetMinutes).toBeUndefined();
+      const skewed = instant - 7 * 3600_000 - 6 * 60_000; // 6 minutes off any zone
+      handler.observeControllerClock(skewed, instant + 200_000);
+      handler.observeControllerClock(skewed + 65_000, instant + 265_000);
+      expect(accessory.context.clockOffsetMinutes).toBeUndefined();
+    });
+
+    it('asks for a confirming reading about a minute after the first one', () => {
+      jest.useFakeTimers();
+      try {
+        clock = instant;
+        const { handler } = build(timer());
+        handler.observeControllerClock(pdt(instant), instant);
+        jest.advanceTimersByTime(64_999);
+        expect(requestRefresh).not.toHaveBeenCalled();
+        jest.advanceTimersByTime(1);
+        expect(requestRefresh).toHaveBeenCalledWith(true);
+        handler.dispose();
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('follows a daylight-saving change of the controller clock', () => {
+      clock = instant;
+      const { handler, accessory } = build(timer());
+      handler.observeControllerClock(pdt(instant), instant);
+      handler.observeControllerClock(pdt(instant + 65_000), instant + 65_000);
+      const pst = (ms: number) => ms - 8 * 3600_000;
+      handler.observeControllerClock(pst(instant + 200_000), instant + 200_000);
+      handler.observeControllerClock(pst(instant + 265_000), instant + 265_000);
+      expect(accessory.context.clockOffsetMinutes).toBe(-480);
+      expect(log.info).toHaveBeenCalledWith("Front House: the controller's clock changed to UTC-08:00");
+    });
+
+    it('uses a learned offset immediately after a restart', () => {
+      clock = instant;
+      const accessory = makeAccessory(timer());
+      accessory.context.clockOffsetMinutes = -420;
+      const { on } = build(timer(), 'lightbulb', accessory);
+      expect(on.value).toBe(true);
+    });
+
+    it('lets a configured time zone override the controller clock', () => {
+      clock = instant;
+      const acc = makeAccessory(timer());
+      const handler = new TrimlightAccessory({
+        api, log, client, exposeAs: 'lightbulb', now: () => clock, clockTickMs: 0, requestRefresh, timeZone: 'Asia/Tokyo',
+      }, acc);
+      handler.observeControllerClock(pdt(instant), instant);
+      handler.observeControllerClock(pdt(instant + 65_000), instant + 65_000);
+      expect(acc.context.clockOffsetMinutes).toBeUndefined();
+      expect(handler.zone).toBe('Asia/Tokyo');
+      // 12:20 in Tokyo: outside the 18:00-21:00 window.
+      expect(acc.getService(Service.Lightbulb)!.getCharacteristic(Characteristic.On).value).toBe(false);
     });
   });
 });

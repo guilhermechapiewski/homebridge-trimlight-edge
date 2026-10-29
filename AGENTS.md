@@ -66,6 +66,15 @@ HOOBS boxes run old runtimes, seen in the wild as Node 14–16 with Homebridge 1
   - An off or manual state that the plugin didn't command (`context.commandedState`) means the user changed it in the Trimlight app, so the schedule memory is dropped.
 - Polled state is ignored for 10 s after a command, so a stale poll can't flip the tile back.
 
+## Time zones (0.2.1)
+
+The owner's HOOBS box runs on **UTC** (`/etc/timezone` = `Etc/UTC`) while the house and controller are on Pacific time, so 0.2.0 showed timer-mode lights off during their window. The owner does **not** want the box's time zone changed; the plugin must work in any host zone.
+- Schedules are evaluated on the **controller clock offset learned from `detail.currentDatetime`** (persisted in `context.clockOffsetMinutes`). That's the clock the controller runs its schedule on, so following it is correct by definition. Before it's learned, host local time is used, and a UTC host logs a one-time info line.
+- **No time zone setting in the UI** (owner decision: "it should just work"). A `timezone` key in config.json still works as an undocumented override, for controllers that never report their clock. Don't add it to the form or README.
+- The offset is trusted only after two readings ≥60 s apart that tick in step with real time (stale detail can be days old) and sit within 2 min of a 15-min offset no more than 14 h from UTC. The accessory requests its own confirming read about 65 s after the first one.
+- `currentDate` sent to Trimlight uses the same zone. The Home Assistant integration says it "drives the device clock"; the owner's lights kept their schedule while 0.2.0 sent UTC, so it's probably ignored, but don't send wrong times.
+- `src/timeZone.ts` handles conversion with `Intl` (no dependencies). Tests pass with the host in UTC, Tokyo, Kiritimati, St. John's, London and LA (`TZ=... npx jest`). The e2e takes `E2E_HOMEBRIDGE_TZ=UTC` to run Homebridge in a different zone from the mock controller.
+
 ## Refresh model (owner-approved; 0.2.0)
 
 The owner asked to avoid constant polling (0.1.0 made about 8,600 calls a day at 30 s).
@@ -85,7 +94,7 @@ The owner asked to avoid constant polling (0.1.0 made about 8,600 calls a day at
 ## Status (update as work lands)
 
 - Done: on/off with schedule awareness and "off for tonight"; tests and e2e green on Homebridge 1.3.4, 1.5.0, 1.11.4 and 2.4.0. The real cloud has been checked with the owner's credentials (list/detail/on/off). 0.1.0 is installed and working on the owner's HOOBS (on/off from Apple Home confirmed 2026-10-29).
-- 0.2.0 (refresh model above) is built and tested and awaits publishing by the owner.
+- 0.2.0 (refresh model) is published and installed on the owner's HOOBS. It showed timer-mode lights off during their window because the box is on UTC; 0.2.1 fixes that (see Time zones).
 - Published: `homebridge-trimlight-edge@0.1.0` on npm (2026-10-29). The owner publishes from their own terminal (`npm publish`), approving with npm 2FA (security key / Touch ID); agents can't complete that step. npm's staged publishing shows a `0.0.0-stage` placeholder for a few minutes before the real version appears.
 - Next: install on HOOBS in a separate bridge and run the on-phone checklist (on/off, Siri, Trimlight-app change, offline, restart, and "off for tonight" during a real 18:00-21:00 window).
 - Releasing a new version: bump `version` in package.json, verify (lint, test, e2e including against the packed tarball), commit, then the owner runs `npm publish` and pushes.

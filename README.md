@@ -80,13 +80,14 @@ Things to know:
 - The plugin treats a controller as "running on a schedule" once it has seen it in timer mode. This survives Homebridge/HOOBS restarts.
 - If you switch the controller to off or manual **in the Trimlight app**, the plugin treats that as your choice and stops restoring the schedule until it sees timer mode again.
 - The switch back to timer mode happens within about a minute after the window ends. The plugin re-checks the Trimlight cloud first, so it never overrides a change you made in the Trimlight app in the meantime. Lights stay off in between.
-- Schedule windows are evaluated using the Homebridge/HOOBS device's clock and time zone, so make sure it matches your house.
+- Schedule windows are evaluated on the **controller's own clock**, which the plugin learns automatically, so it doesn't matter what time zone your Homebridge/HOOBS box runs in (HOOBS boxes typically run on UTC). Right after the first install this takes about a minute.
 
 ## Troubleshooting
 
 - **"Trimlight rejected the API credentials"**: double-check `clientId`/`clientSecret`. These are API credentials (see [Getting your API credentials](#getting-your-api-credentials)), not your app login.
 - **Accessory shows "No Response"**: the controller is offline according to the Trimlight cloud (check its Wi-Fi), or the last command failed. Details are in the HOOBS/Homebridge log.
 - **HOOBS shows "0 plugins installed" / no settings form right after a release**: the HOOBS app takes plugin details from its own plugin directory, which picks up new npm releases with a delay. The plugin still runs. To enter your credentials meanwhile, run [`scripts/hoobs-set-credentials.js`](scripts/hoobs-set-credentials.js) on the HOOBS box (`node hoobs-set-credentials.js <bridge-id>`; bridge ids are listed in `/var/lib/hoobs/bridges.conf`). Log in with your HOOBS **username** from the Profiles page, not your email. Then restart the bridge.
+- **Timer-mode lights show the wrong on/off state**: check the log for `following the controller's clock (UTC-07:00)` or similar, which should appear about a minute after the first install. The controller's clock is set by the Trimlight app; if the offset shown is wrong, open the Trimlight app so it can sync the controller's time.
 - **Status takes a while to update after using the Trimlight app**: open the Home app. It shows the last known state immediately and updates within a few seconds. While Home is closed, changes made in the Trimlight app are picked up by the background check (every 15 minutes by default), so HomeKit automations triggered by the Trimlight's state react with that delay.
 
 ## Development
