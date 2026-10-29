@@ -1,0 +1,62 @@
+{
+  "pluginAlias": "TrimlightEdge",
+  "pluginType": "platform",
+  "singular": true,
+  "headerDisplay": "Control your Trimlight Edge lights from Apple Home. You need Trimlight API credentials (Client ID and Client Secret), which you can apply for via [Trimlight's open API support page](https://trimlight.com/support/does-the-edge-have-an-open-api).",
+  "footerDisplay": "All controllers on your Trimlight account are added automatically.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "Trimlight Edge",
+        "required": true,
+        "description": "Name shown in the Homebridge logs."
+      },
+      "clientId": {
+        "title": "Client ID",
+        "type": "string",
+        "required": true,
+        "description": "Your Trimlight API Client ID."
+      },
+      "clientSecret": {
+        "title": "Client Secret",
+        "type": "string",
+        "required": true,
+        "description": "Your Trimlight API Client Secret."
+      },
+      "exposeAs": {
+        "title": "Show in Home as",
+        "type": "string",
+        "default": "lightbulb",
+        "oneOf": [
+          { "title": "Light", "enum": ["lightbulb"] },
+          { "title": "Switch", "enum": ["switch"] }
+        ],
+        "description": "Light (recommended) is included in \"turn off all the lights\" and Siri light commands. Switch shows a plain power switch."
+      },
+      "pollingIntervalSeconds": {
+        "title": "Status refresh interval (seconds)",
+        "type": "integer",
+        "default": 30,
+        "minimum": 10,
+        "description": "How often to check the Trimlight cloud for changes made outside of Apple Home (e.g. in the Trimlight app or by a schedule)."
+      }
+    }
+  },
+  "layout": [
+    "name",
+    "clientId",
+    {
+      "key": "clientSecret",
+      "type": "password"
+    },
+    {
+      "type": "fieldset",
+      "title": "Advanced",
+      "expandable": true,
+      "items": ["exposeAs", "pollingIntervalSeconds"]
+    }
+  ]
+}
