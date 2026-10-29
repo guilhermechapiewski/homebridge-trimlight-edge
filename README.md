@@ -40,7 +40,7 @@ npm pack            # creates homebridge-trimlight-edge-<version>.tgz
 ```
 
 - **Homebridge (global npm install):** `sudo npm install -g ./homebridge-trimlight-edge-<version>.tgz`, then restart Homebridge.
-- **HOOBS:** HOOBS manages plugins itself and does not load globally installed ones. Copy the `.tgz` to the device and try `sudo hbs plugin add /path/to/homebridge-trimlight-edge-<version>.tgz`. Local-file installs are not well documented by HOOBS, so publishing to npm and installing from the HOOBS plugin search is the most reliable route.
+- **HOOBS:** HOOBS installs plugins from npm by name only (`hbs plugin add` runs `yarn add <name>@<version>`) and never loads globally installed ones, so a local `.tgz` can't be installed through it. Publish to npm and install from the HOOBS plugin search (or `sudo hbs plugin add homebridge-trimlight-edge` over SSH).
 
 ## Configuration
 
