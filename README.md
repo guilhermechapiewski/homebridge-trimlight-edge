@@ -27,20 +27,13 @@ Every Trimlight Edge controller on your account appears in Apple Home as a light
 
 ## Installation
 
-### From npm (once published)
+The plugin is published on npm as [`homebridge-trimlight-edge`](https://www.npmjs.com/package/homebridge-trimlight-edge).
 
-Search for `homebridge-trimlight-edge` in the HOOBS or Homebridge UI plugin search and install it.
+- **HOOBS:** search for `homebridge-trimlight-edge` in the plugin search and install it. Putting it in its own bridge keeps it isolated from your other accessories. Over SSH, `sudo hbs plugin add homebridge-trimlight-edge` does the same. HOOBS only installs plugins from npm, not from local files.
+- **Homebridge UI:** search for `homebridge-trimlight-edge` on the Plugins tab and install it.
+- **Command line:** `sudo npm install -g homebridge-trimlight-edge`, then restart Homebridge.
 
-### From this repository (before publishing)
-
-```bash
-npm install
-npm run build
-npm pack            # creates homebridge-trimlight-edge-<version>.tgz
-```
-
-- **Homebridge (global npm install):** `sudo npm install -g ./homebridge-trimlight-edge-<version>.tgz`, then restart Homebridge.
-- **HOOBS:** HOOBS installs plugins from npm by name only (`hbs plugin add` runs `yarn add <name>@<version>`) and never loads globally installed ones, so a local `.tgz` can't be installed through it. Publish to npm and install from the HOOBS plugin search (or `sudo hbs plugin add homebridge-trimlight-edge` over SSH).
+To try unreleased changes from this repository on a regular Homebridge install, run `npm install && npm run build && npm pack`, then `sudo npm install -g ./homebridge-trimlight-edge-<version>.tgz`.
 
 ## Configuration
 

@@ -75,5 +75,7 @@ HOOBS boxes run old runtimes, seen in the wild as Node 14–16 with Homebridge 1
 ## Status (update as work lands)
 
 - Done: on/off with schedule awareness and "off for tonight"; tests and e2e green on Homebridge 1.3.4, 1.5.0, 1.11.4 and 2.4.0. The real cloud has been checked with the owner's credentials (list/detail/on/off).
-- Next: deploy. Owner runs `npm login`, then publish v0.1.0 (with the owner's OK; the npm name was free as of 2026-10-28), then install on HOOBS and run the on-phone checklist in the README/plan.
+- Published: `homebridge-trimlight-edge@0.1.0` on npm (2026-10-29). The owner publishes from their own terminal (`npm publish`), approving with npm 2FA (security key / Touch ID); agents can't complete that step. npm's staged publishing shows a `0.0.0-stage` placeholder for a few minutes before the real version appears.
+- Next: install on HOOBS in a separate bridge and run the on-phone checklist (on/off, Siri, Trimlight-app change, offline, restart, and "off for tonight" during a real 18:00-21:00 window).
+- Releasing a new version: bump `version` in package.json, verify (lint, test, e2e including against the packed tarball), commit, then the owner runs `npm publish` and pushes.
 - Later: brightness, color, effects. Use trimlight-edge-ha as the reference for the effect API pitfalls.
