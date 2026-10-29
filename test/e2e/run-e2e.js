@@ -151,7 +151,6 @@ async function main() {
       name: 'Trimlight Edge',
       clientId: CLIENT_ID,
       clientSecret: CLIENT_SECRET,
-      pollingIntervalSeconds: 10,
       baseUrl: cloudUrl,
     }],
   }, null, 2));
@@ -203,18 +202,18 @@ async function main() {
     // Changed outside HomeKit (e.g. from the Trimlight app). Wait past the
     // post-command cooldown plus one poll.
     state.devices[0].switchState = 1;
-    await waitFor('external change to reach HomeKit', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
-    step('turning on in the Trimlight app shows as on via polling');
+    await waitFor('external change to reach HomeKit', async () => (await readOn(hapPort, aid, iid)).value === true, 45000);
+    step('turning on in the Trimlight app shows as on when HomeKit looks (refresh on read)');
 
     // Timer mode: lit only inside a schedule window. Windows are built around
     // the current time so the test doesn't depend on when it runs.
     state.devices[0].switchState = 2;
     state.devices[0].daily = [dailyWindow(120, 180)];
-    await waitFor('timer mode outside its window to show off', async () => (await readOn(hapPort, aid, iid)).value === false, 30000);
+    await waitFor('timer mode outside its window to show off', async () => (await readOn(hapPort, aid, iid)).value === false, 45000);
     step('timer mode outside its schedule window shows as off');
 
     state.devices[0].daily = [dailyWindow(-60, 60)];
-    await waitFor('timer mode inside its window to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
+    await waitFor('timer mode inside its window to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 45000);
     step('timer mode inside its schedule window shows as on');
 
     const commandsBefore = state.requests.filter((r) => r.path.endsWith('/device/update')).length;
@@ -225,7 +224,7 @@ async function main() {
     step('"turn on" while the schedule has it lit leaves timer mode alone');
 
     state.devices[0].daily = [dailyWindow(120, 180)];
-    await waitFor('timer mode back outside its window', async () => (await readOn(hapPort, aid, iid)).value === false, 30000);
+    await waitFor('timer mode back outside its window', async () => (await readOn(hapPort, aid, iid)).value === false, 45000);
     res = await hap(hapPort, 'PUT', '/characteristics', { characteristics: [{ aid, iid, value: true }] });
     assert.ok(res.status === 204 || res.status === 207, `unexpected status ${res.status}`);
     assert.strictEqual(state.devices[0].switchState, 1);
@@ -242,7 +241,7 @@ async function main() {
     // Off during a window that ends at the next minute: off now, then timer
     // mode is restored by the plugin once the window is over.
     state.devices[0].daily = [dailyWindow(-60, 2)];
-    await waitFor('timer window to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
+    await waitFor('timer window to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 45000);
     res = await hap(hapPort, 'PUT', '/characteristics', { characteristics: [{ aid, iid, value: false }] });
     assert.ok(res.status === 204 || res.status === 207, `unexpected status ${res.status}`);
     assert.strictEqual(state.devices[0].switchState, 0);
@@ -253,17 +252,24 @@ async function main() {
     step('timer schedule is restored automatically once the window ends');
 
     state.devices[0].switchState = 1;
-    await waitFor('manual mode to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
+    await waitFor('manual mode to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 45000);
 
     const detailReads = state.requests.filter((r) => r.path.endsWith('/device/get'));
     assert.ok(detailReads.length > 0 && detailReads.every((r) => r.body.deviceId === DEVICE_ID && r.body.currentDate), 'detail reads must carry deviceId and currentDate');
     step('state is read from the device detail endpoint');
 
+    // Nobody is looking at the accessory: the plugin must not poll the cloud.
+    const quietStart = state.requests.length;
+    await sleep(40000);
+    const quietRequests = state.requests.slice(quietStart).map((r) => r.path);
+    assert.deepStrictEqual(quietRequests, [], `expected no API calls while idle, got ${quietRequests.join(', ')}`);
+    step('no API calls for 40 s while nothing reads the accessory');
+
     state.devices[0].connectivity = 0;
-    await waitFor('offline controller to show No Response', async () => (await readOn(hapPort, aid, iid)).status === -70402, 20000);
+    await waitFor('offline controller to show No Response', async () => (await readOn(hapPort, aid, iid)).status === -70402, 45000);
     step('offline controller shows "No Response" in HomeKit');
     state.devices[0].connectivity = 1;
-    await waitFor('controller to come back', async () => (await readOn(hapPort, aid, iid)).value === true, 20000);
+    await waitFor('controller to come back', async () => (await readOn(hapPort, aid, iid)).value === true, 45000);
     step('controller coming back online recovers');
 
     // Restart in the middle of "off for tonight": the pending schedule
@@ -272,9 +278,9 @@ async function main() {
     // (it was in manual mode, which already reads as on).
     state.devices[0].switchState = 2;
     state.devices[0].daily = [dailyWindow(120, 180)];
-    await waitFor('timer mode (dark) to be seen before restart', async () => (await readOn(hapPort, aid, iid)).value === false, 30000);
+    await waitFor('timer mode (dark) to be seen before restart', async () => (await readOn(hapPort, aid, iid)).value === false, 45000);
     state.devices[0].daily = [dailyWindow(-60, 2)];
-    await waitFor('timer window to show on before restart', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
+    await waitFor('timer window to show on before restart', async () => (await readOn(hapPort, aid, iid)).value === true, 45000);
     res = await hap(hapPort, 'PUT', '/characteristics', { characteristics: [{ aid, iid, value: false }] });
     assert.ok(res.status === 204 || res.status === 207, `unexpected status ${res.status}`);
     assert.strictEqual(state.devices[0].switchState, 0);

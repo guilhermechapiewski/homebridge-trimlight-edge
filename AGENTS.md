@@ -43,14 +43,14 @@ HOOBS boxes run old runtimes, seen in the wild as Node 14–16 with Homebridge 1
 - `src/trimlightApi.ts`: cloud client. Handles HMAC signing, serialized and spaced requests (300 ms), retries with backoff for 5xx/429/network/20000, and typed errors (`TrimlightApiError`, `TrimlightAuthError`).
 - `src/schedule.ts`: decides whether timer mode is lit right now, from the daily/calendar schedules. Ported from the MIT-licensed [trimlight-edge-ha](https://github.com/Michael-Civitillo/trimlight-edge-ha).
 - `src/trimlightAccessory.ts`: the HomeKit Lightbulb (or Switch) for each controller, `isLit()`, and the "off for tonight" state machine.
-- `src/platform.ts`: config parsing, polling (list → notify-update-shadow → detail per online device), and accessory add/restore/remove.
+- `src/platform.ts`: config parsing, the refresh model (see below), and accessory add/restore/remove.
 - `test/e2e/`: mock cloud (mirrors real responses) and the end-to-end runner (drives Homebridge's insecure HAP HTTP API).
 - `trimlight-edge-api-doc.md`: the official API doc (converted from PDF). It has gaps and errors; see the quirks below.
 
 ## Real Trimlight API behavior (verified; differs from the doc)
 
 - **The device list has no `switchState`.** On/off only comes from `POST /v1/oauth/resources/device/get` (detail). The list's `fwVersionName` (e.g. `1.17.4173`) differs from the detail's (`1.17.77`); the plugin uses the list's.
-- **Detail can be stale by days** until the controller reports in. Call `GET .../device/notify-update-shadow` first; `currentDatetime` in the detail shows how fresh it is. Detail reflected a `device/update` immediately in testing.
+- **Detail can be stale by days** until the controller reports in. Call `GET .../device/notify-update-shadow` first, then **wait ~2 s** before reading the detail. Reading immediately can return the state from before a change made in the Trimlight app; the owner saw Home show the wrong state with 0.1.0. `currentDatetime` in the detail shows how fresh it is. Detail reflected a `device/update` immediately in testing. `node scripts/trimlight-cli.js watch <id>` shows this live.
 - **Bad credentials return HTTP 207** with an OAuth body (`{"error":"invalid_token","error_description":"The access token expired"}`), not the documented code `10001`. A missing token returns HTTP 401. "Token expired" can also mean the host clock is wrong.
 - **GET endpoints take a JSON body** (e.g. `{"page":0}` for the device list).
 - **Error 20000** means requests came too fast or concurrently, so keep them serialized. Per trimlight-edge-ha: **12006** means the cloud can't parse the stored effects (duplicate or oddly named effects), and when saving effects, `category` must be `0` (built-in) or `1` (custom), whatever the doc's examples show.
@@ -66,6 +66,14 @@ HOOBS boxes run old runtimes, seen in the wild as Node 14–16 with Homebridge 1
   - An off or manual state that the plugin didn't command (`context.commandedState`) means the user changed it in the Trimlight app, so the schedule memory is dropped.
 - Polled state is ignored for 10 s after a command, so a stale poll can't flip the tile back.
 
+## Refresh model (owner-approved; 0.2.0)
+
+The owner asked to avoid constant polling (0.1.0 made about 8,600 calls a day at 30 s).
+- **On HomeKit read** (the Home app, widgets, Siri, HomePod): `onGet` answers instantly from cached state and triggers a background refresh (notify, wait 2 s, then detail). Refreshes are throttled to one per device per 15 s and coalesced; a change is pushed with `updateCharacteristic`.
+- **Local clock tick every 60 s** (no API calls): re-evaluates timer schedules so Home flips at window boundaries. When an "off for tonight" restore is due, it **forces a fresh read first**, so it never overrides a Trimlight-app change made while Home was closed.
+- **Background check** (device list plus status) at startup and every `pollingIntervalSeconds` (default 900; min 60; 0 = off). Failed checks retry after 30 s, doubling.
+- Trade-off: HomeKit automations triggered by Trimlight state see Trimlight-app changes only on the next background check.
+
 ## Deployment notes
 
 - Install route: **publish to npm**, then install from the HOOBS plugin search, or over SSH with `sudo hbs plugin add homebridge-trimlight-edge`. The plan is to put it in a separate HOOBS bridge for isolation.
@@ -76,7 +84,8 @@ HOOBS boxes run old runtimes, seen in the wild as Node 14–16 with Homebridge 1
 
 ## Status (update as work lands)
 
-- Done: on/off with schedule awareness and "off for tonight"; tests and e2e green on Homebridge 1.3.4, 1.5.0, 1.11.4 and 2.4.0. The real cloud has been checked with the owner's credentials (list/detail/on/off).
+- Done: on/off with schedule awareness and "off for tonight"; tests and e2e green on Homebridge 1.3.4, 1.5.0, 1.11.4 and 2.4.0. The real cloud has been checked with the owner's credentials (list/detail/on/off). 0.1.0 is installed and working on the owner's HOOBS (on/off from Apple Home confirmed 2026-10-29).
+- 0.2.0 (refresh model above) is built and tested and awaits publishing by the owner.
 - Published: `homebridge-trimlight-edge@0.1.0` on npm (2026-10-29). The owner publishes from their own terminal (`npm publish`), approving with npm 2FA (security key / Touch ID); agents can't complete that step. npm's staged publishing shows a `0.0.0-stage` placeholder for a few minutes before the real version appears.
 - Next: install on HOOBS in a separate bridge and run the on-phone checklist (on/off, Siri, Trimlight-app change, offline, restart, and "off for tonight" during a real 18:00-21:00 window).
 - Releasing a new version: bump `version` in package.json, verify (lint, test, e2e including against the packed tarball), commit, then the owner runs `npm publish` and pushes.

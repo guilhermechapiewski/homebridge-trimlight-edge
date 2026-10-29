@@ -31,17 +31,27 @@
         "type": "string",
         "default": "lightbulb",
         "oneOf": [
-          { "title": "Light", "enum": ["lightbulb"] },
-          { "title": "Switch", "enum": ["switch"] }
+          {
+            "title": "Light",
+            "enum": [
+              "lightbulb"
+            ]
+          },
+          {
+            "title": "Switch",
+            "enum": [
+              "switch"
+            ]
+          }
         ],
         "description": "Light (recommended) is included in \"turn off all the lights\" and Siri light commands. Switch shows a plain power switch."
       },
       "pollingIntervalSeconds": {
-        "title": "Status refresh interval (seconds)",
+        "title": "Background check interval (seconds)",
         "type": "integer",
-        "default": 30,
-        "minimum": 10,
-        "description": "How often to check the Trimlight cloud for changes made outside of Apple Home (e.g. in the Trimlight app or by a schedule)."
+        "default": 900,
+        "minimum": 0,
+        "description": "How often to check the Trimlight cloud in the background for changes made outside Apple Home (e.g. in the Trimlight app). Status is also refreshed whenever the Home app shows the lights. Minimum 60; 0 turns background checks off."
       }
     }
   },
@@ -56,7 +66,10 @@
       "type": "fieldset",
       "title": "Advanced",
       "expandable": true,
-      "items": ["exposeAs", "pollingIntervalSeconds"]
+      "items": [
+        "exposeAs",
+        "pollingIntervalSeconds"
+      ]
     }
   ]
 }

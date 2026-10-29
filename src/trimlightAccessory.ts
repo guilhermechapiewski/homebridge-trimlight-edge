@@ -33,6 +33,14 @@ export interface TrimlightAccessoryDeps {
    * that raced the command cannot flip the tile back in the Home app.
    */
   commandCooldownMs?: number;
+  /**
+   * Asks the platform to refresh this device's status from the cloud (the
+   * result arrives via `update`). Called when HomeKit reads the accessory, and
+   * with `force` before restoring a schedule.
+   */
+  requestRefresh?: (force?: boolean) => Promise<void>;
+  /** How often to re-evaluate schedules locally; 0 disables (tests). */
+  clockTickMs?: number;
   now?: () => number;
 }
 
@@ -66,8 +74,9 @@ export function sanitizeName(name: string | undefined, fallback = 'Trimlight'): 
 /**
  * Exposes one Trimlight Edge controller to HomeKit as an on/off accessory.
  *
- * Reads are served from the last known state (kept fresh by the platform's
- * polling) so HomeKit is never blocked on a cloud round trip.
+ * Reads are answered instantly from the last known state and trigger a
+ * background refresh, so HomeKit is never blocked on a cloud round trip.
+ * Schedule windows are followed with a local clock tick (no API calls).
  */
 export class TrimlightAccessory {
   private readonly service: Service;
@@ -77,6 +86,7 @@ export class TrimlightAccessory {
   private online: boolean;
   private ignorePollsUntil = 0;
   private restoringSchedule = false;
+  private clockTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly deps: TrimlightAccessoryDeps,
@@ -119,6 +129,40 @@ export class TrimlightAccessory {
     this.service.getCharacteristic(C.On)
       .onGet(this.handleGet.bind(this))
       .onSet(this.handleSet.bind(this));
+
+    const tickMs = deps.clockTickMs ?? 60_000;
+    if (tickMs > 0) {
+      this.clockTimer = setInterval(() => this.checkClock(), tickMs);
+      this.clockTimer.unref?.();
+    }
+  }
+
+  /** Stops the local clock tick (accessory removed or Homebridge shutting down). */
+  dispose(): void {
+    if (this.clockTimer) {
+      clearInterval(this.clockTimer);
+      this.clockTimer = undefined;
+    }
+  }
+
+  /**
+   * Re-evaluates the schedules against the clock without calling the cloud,
+   * so a timer-mode controller flips on/off in HomeKit at its window
+   * boundaries. When an "off for tonight" restore is due, asks for a fresh
+   * status first so it never overrides a change made in the Trimlight app.
+   */
+  checkClock(): void {
+    if (this.now() < this.ignorePollsUntil) {
+      return;
+    }
+    this.setOn(isLit(this.accessory.context.device, new Date(this.now())));
+    if (this.restoreDue()) {
+      if (this.deps.requestRefresh) {
+        void this.deps.requestRefresh(true);
+      } else {
+        this.restoreScheduleIfWindowOver();
+      }
+    }
   }
 
   get deviceId(): string {
@@ -138,7 +182,7 @@ export class TrimlightAccessory {
     } else {
       this.accessory.context.device = device;
       this.trackMode(device.switchState);
-      this.on = isLit(device, new Date(this.now()));
+      this.setOn(isLit(device, new Date(this.now())), false);
       this.restoreScheduleIfWindowOver();
     }
     this.updateFirmware(device);
@@ -154,7 +198,25 @@ export class TrimlightAccessory {
     }
   }
 
+  /** Records a change of the lit state, logging it and (optionally) pushing it to HomeKit. */
+  private setOn(on: boolean, push = true): void {
+    if (on === this.on) {
+      return;
+    }
+    this.on = on;
+    const switchState = this.accessory.context.device.switchState;
+    const mode = switchState === SwitchState.Timer ? 'timer schedule' : switchState === SwitchState.Manual ? 'manual' : 'off';
+    this.deps.log.info(`${this.accessory.displayName} is now ${on ? 'on' : 'off'} (${mode})`);
+    if (push && this.online) {
+      this.service.updateCharacteristic(this.deps.api.hap.Characteristic.On, on);
+    }
+  }
+
   private async handleGet(): Promise<CharacteristicValue> {
+    // HomeKit is looking at this accessory (Home app, widget, Siri): answer
+    // now from the last known state and refresh in the background; a change
+    // is pushed to HomeKit when it arrives.
+    void this.deps.requestRefresh?.();
     if (!this.online) {
       const { HapStatusError, HAPStatus } = this.deps.api.hap;
       throw new HapStatusError(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
@@ -244,15 +306,10 @@ export class TrimlightAccessory {
    * tomorrow evening) runs as usual.
    */
   private restoreScheduleIfWindowOver(): void {
+    if (!this.restoreDue()) {
+      return;
+    }
     const context = this.accessory.context;
-    if (!context.followsSchedule || context.commandedState !== SwitchState.Off
-      || context.device.switchState !== SwitchState.Off || !this.online || this.restoringSchedule) {
-      return;
-    }
-    if (isScheduleLit(context.device, new Date(this.now())) !== false) {
-      return;
-    }
-
     const name = this.accessory.displayName;
     this.restoringSchedule = true;
     this.deps.client.setSwitchState(this.deviceId, SwitchState.Timer)
@@ -270,6 +327,14 @@ export class TrimlightAccessory {
       .finally(() => {
         this.restoringSchedule = false;
       });
+  }
+
+  /** An "off for tonight" is pending and the schedule window is now over. */
+  private restoreDue(): boolean {
+    const context = this.accessory.context;
+    return !!context.followsSchedule && context.commandedState === SwitchState.Off
+      && context.device.switchState === SwitchState.Off && this.online && !this.restoringSchedule
+      && isScheduleLit(context.device, new Date(this.now())) === false;
   }
 
   private applyCommandedState(target: SwitchState): void {

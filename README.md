@@ -8,7 +8,7 @@ Every Trimlight Edge controller on your account appears in Apple Home as a light
 
 - Automatic discovery of all controllers on your Trimlight account
 - On/off from Apple Home, Siri, scenes and automations
-- Status stays in sync when lights are changed from the Trimlight app or by a schedule (polled every 30 s by default)
+- Status stays in sync without constant polling. The plugin refreshes from the Trimlight cloud whenever the Home app (or a widget, or Siri) looks at the lights, follows your schedule windows on its own clock, and runs a light background check every 15 minutes
 - Controllers that are offline show as **No Response** instead of a wrong state
 - Understands Trimlight timer schedules: shows on only while a schedule window is active, "turn on" never interrupts a running schedule, and "turn off" only lasts until the current window ends (your schedule keeps running the next day)
 - No runtime dependencies; works on the older Node.js/Homebridge versions found on HOOBS boxes
@@ -54,7 +54,7 @@ Fill in the settings form in the HOOBS/Homebridge UI, or add this to the `platfo
 | `clientId` | Yes | | Trimlight API Client ID |
 | `clientSecret` | Yes | | Trimlight API Client Secret |
 | `exposeAs` | No | `lightbulb` | `lightbulb` (included in "turn off all the lights") or `switch` |
-| `pollingIntervalSeconds` | No | `30` | How often to refresh status from the Trimlight cloud (minimum 10) |
+| `pollingIntervalSeconds` | No | `900` | Background check interval in seconds (minimum 60; `0` turns it off). Status is also refreshed whenever the Home app shows the accessory |
 
 After restarting you should see something like:
 
@@ -79,7 +79,7 @@ Things to know:
 
 - The plugin treats a controller as "running on a schedule" once it has seen it in timer mode. This survives Homebridge/HOOBS restarts.
 - If you switch the controller to off or manual **in the Trimlight app**, the plugin treats that as your choice and stops restoring the schedule until it sees timer mode again.
-- The switch back to timer mode happens on the first status refresh after the window ends (within `pollingIntervalSeconds`). Lights stay off in between.
+- The switch back to timer mode happens within about a minute after the window ends. The plugin re-checks the Trimlight cloud first, so it never overrides a change you made in the Trimlight app in the meantime. Lights stay off in between.
 - Schedule windows are evaluated using the Homebridge/HOOBS device's clock and time zone, so make sure it matches your house.
 
 ## Troubleshooting
@@ -87,7 +87,7 @@ Things to know:
 - **"Trimlight rejected the API credentials"**: double-check `clientId`/`clientSecret`. These are API credentials (see [Getting your API credentials](#getting-your-api-credentials)), not your app login.
 - **Accessory shows "No Response"**: the controller is offline according to the Trimlight cloud (check its Wi-Fi), or the last command failed. Details are in the HOOBS/Homebridge log.
 - **HOOBS shows "0 plugins installed" / no settings form right after a release**: the HOOBS app takes plugin details from its own plugin directory, which picks up new npm releases with a delay. The plugin still runs. To enter your credentials meanwhile, run [`scripts/hoobs-set-credentials.js`](scripts/hoobs-set-credentials.js) on the HOOBS box (`node hoobs-set-credentials.js <bridge-id>`; bridge ids are listed in `/var/lib/hoobs/bridges.conf`). Log in with your HOOBS **username** from the Profiles page, not your email. Then restart the bridge.
-- **Status takes a while to update after using the Trimlight app**: changes made outside Apple Home are picked up on the next refresh (`pollingIntervalSeconds`).
+- **Status takes a while to update after using the Trimlight app**: open the Home app. It shows the last known state immediately and updates within a few seconds. While Home is closed, changes made in the Trimlight app are picked up by the background check (every 15 minutes by default), so HomeKit automations triggered by the Trimlight's state react with that delay.
 
 ## Development
 

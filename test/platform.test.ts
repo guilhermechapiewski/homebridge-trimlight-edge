@@ -12,21 +12,26 @@ const baseConfig: PlatformConfig = { platform: PLATFORM_NAME, clientId: 'id', cl
 describe('parseConfig', () => {
   it('applies defaults', () => {
     expect(parseConfig(baseConfig)).toEqual({
-      clientId: 'id', clientSecret: 'secret', pollingIntervalSeconds: 30, exposeAs: 'lightbulb', baseUrl: undefined,
+      clientId: 'id', clientSecret: 'secret', pollingIntervalSeconds: 900, exposeAs: 'lightbulb', baseUrl: undefined,
     });
   });
 
   it('trims credentials and accepts overrides', () => {
-    expect(parseConfig({ ...baseConfig, clientId: ' id ', pollingIntervalSeconds: '45', exposeAs: 'switch' })).toMatchObject({
-      clientId: 'id', pollingIntervalSeconds: 45, exposeAs: 'switch',
+    expect(parseConfig({ ...baseConfig, clientId: ' id ', pollingIntervalSeconds: '120', exposeAs: 'switch' })).toMatchObject({
+      clientId: 'id', pollingIntervalSeconds: 120, exposeAs: 'switch',
     });
   });
 
+  it('allows 0 (background checks off) and raises short intervals to the 60 s minimum', () => {
+    expect(parseConfig({ ...baseConfig, pollingIntervalSeconds: 0 })).toMatchObject({ pollingIntervalSeconds: 0 });
+    expect(parseConfig({ ...baseConfig, pollingIntervalSeconds: 30 })).toMatchObject({ pollingIntervalSeconds: 60 });
+  });
+
   it('reports every problem at once', () => {
-    expect(parseConfig({ platform: PLATFORM_NAME, pollingIntervalSeconds: 2, exposeAs: 'fan' })).toEqual([
+    expect(parseConfig({ platform: PLATFORM_NAME, pollingIntervalSeconds: -1, exposeAs: 'fan' })).toEqual([
       '"clientId" is required',
       '"clientSecret" is required',
-      '"pollingIntervalSeconds" must be a number >= 10',
+      '"pollingIntervalSeconds" must be 0 (off) or a number of seconds',
       '"exposeAs" must be "lightbulb" or "switch"',
     ]);
   });
@@ -56,7 +61,8 @@ describe('TrimlightPlatform', () => {
     }]));
   };
 
-  const createPlatform = (config: PlatformConfig = baseConfig) => new TrimlightPlatform(log, config, api, () => client);
+  const createPlatform = (config: PlatformConfig = baseConfig) =>
+    new TrimlightPlatform(log, config, api, () => client, { notifySettleMs: 0 });
 
   const launch = async (platform: TrimlightPlatform) => {
     api.signalFinished();
@@ -168,13 +174,13 @@ describe('TrimlightPlatform', () => {
   });
 
   it('polls on the configured interval and pushes state changes to HomeKit', async () => {
-    await launch(createPlatform({ ...baseConfig, pollingIntervalSeconds: 15 }));
+    await launch(createPlatform({ ...baseConfig, pollingIntervalSeconds: 120 }));
     expect(client.listDevices).toHaveBeenCalledTimes(1);
     const on = registered[0].getService(api.hap.Service.Lightbulb)!.getCharacteristic(api.hap.Characteristic.On);
     expect(on.value).toBe(false);
 
     setCloud(makeDevice({ switchState: SwitchState.Manual }));
-    await jest.advanceTimersByTimeAsync(14_999);
+    await jest.advanceTimersByTimeAsync(119_999);
     expect(client.listDevices).toHaveBeenCalledTimes(1);
     await jest.advanceTimersByTimeAsync(1);
     expect(client.listDevices).toHaveBeenCalledTimes(2);
@@ -192,13 +198,14 @@ describe('TrimlightPlatform', () => {
   it('logs repeated failures once and announces recovery', async () => {
     client.listDevices.mockRejectedValue(new TrimlightApiError('HTTP 502 from Trimlight API'));
     await launch(createPlatform());
+    // Retries back off: 30 s, then 60 s.
     await jest.advanceTimersByTimeAsync(30_000);
-    await jest.advanceTimersByTimeAsync(30_000);
+    await jest.advanceTimersByTimeAsync(60_000);
     expect(log.warn).toHaveBeenCalledTimes(1);
     expect(client.listDevices).toHaveBeenCalledTimes(3);
 
     setCloud(makeDevice());
-    await jest.advanceTimersByTimeAsync(30_000);
+    await jest.advanceTimersByTimeAsync(120_000);
     expect(log.info).toHaveBeenCalledWith('Connection to the Trimlight cloud restored');
     expect(registered).toHaveLength(1);
   });
@@ -243,20 +250,23 @@ describe('TrimlightPlatform', () => {
       await expect(lightbulbOn(registered[0]).handleGetRequest()).resolves.toBe(true);
     });
 
-    it('shows a timer-mode controller as off outside its schedule and on inside it', async () => {
-      jest.setSystemTime(new Date(2026, 9, 28, 12, 0));
+    it('follows the schedule window boundaries locally, without calling the cloud', async () => {
+      jest.setSystemTime(new Date(2026, 9, 28, 17, 58, 30));
       setCloud(realController());
       await launch(createPlatform());
       const on = lightbulbOn(registered[0]);
-      await expect(on.handleGetRequest()).resolves.toBe(false);
+      expect(on.value).toBe(false);
+      const calls = () => client.listDevices.mock.calls.length + client.getDeviceDetail.mock.calls.length;
+      const before = calls();
 
-      jest.setSystemTime(new Date(2026, 9, 28, 18, 0));
-      await jest.advanceTimersByTimeAsync(30_000);
-      await expect(on.handleGetRequest()).resolves.toBe(true);
-
-      jest.setSystemTime(new Date(2026, 9, 28, 21, 0));
-      await jest.advanceTimersByTimeAsync(30_000);
-      await expect(on.handleGetRequest()).resolves.toBe(false);
+      // The once-a-minute clock tick flips it at 18:00 and back at 21:00.
+      await jest.advanceTimersByTimeAsync(2 * 60_000);
+      expect(on.value).toBe(true);
+      expect(log.info).toHaveBeenCalledWith('Front House is now on (timer schedule)');
+      jest.setSystemTime(new Date(2026, 9, 28, 20, 59, 30));
+      await jest.advanceTimersByTimeAsync(60_000);
+      expect(on.value).toBe(false);
+      expect(calls()).toBe(before);
     });
 
     it('turns a timer-mode controller on (manual) when its schedule has it dark', async () => {
@@ -281,14 +291,21 @@ describe('TrimlightPlatform', () => {
       const on = lightbulbOn(registered[0]);
 
       client.getDeviceDetail.mockRejectedValue(new TrimlightApiError('Trimlight API error 12006: Device data could not be parsed', 12006));
-      await jest.advanceTimersByTimeAsync(30_000);
-      await jest.advanceTimersByTimeAsync(30_000);
+      // Two HomeKit reads 15 s apart each trigger a refresh; both fail.
+      for (let i = 0; i < 2; i++) {
+        await jest.advanceTimersByTimeAsync(15_000);
+        await on.handleGetRequest();
+        await jest.advanceTimersByTimeAsync(0);
+      }
+      expect(client.getDeviceDetail).toHaveBeenCalledTimes(3);
       await expect(on.handleGetRequest()).resolves.toBe(true);
       expect(log.warn).toHaveBeenCalledTimes(1);
       expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('12006'));
 
       client.getDeviceDetail.mockImplementation((id: string) => Promise.resolve(details[id]));
-      await jest.advanceTimersByTimeAsync(30_000);
+      await jest.advanceTimersByTimeAsync(15_000);
+      await on.handleGetRequest();
+      await jest.advanceTimersByTimeAsync(0);
       expect(log.info).toHaveBeenCalledWith('Status of Front House is available again');
     });
 
@@ -314,6 +331,144 @@ describe('TrimlightPlatform', () => {
       expect(client.getDeviceDetail).not.toHaveBeenCalled();
       expect(cached.context.device.switchState).toBe(SwitchState.Manual);
       await expect(lightbulbOn(cached).handleGetRequest()).rejects.toBe(api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+    });
+  });
+  describe('refreshing when HomeKit looks, instead of constant polling', () => {
+    const lightbulbOn = (accessory: PlatformAccessory) =>
+      accessory.getService(api.hap.Service.Lightbulb)!.getCharacteristic(api.hap.Characteristic.On);
+
+    it('answers a HomeKit read instantly, then refreshes and pushes the new state', async () => {
+      await launch(createPlatform());
+      const on = lightbulbOn(registered[0]);
+      client.getDeviceDetail.mockClear();
+      client.notifyUpdateShadow.mockClear();
+
+      // Changed in the Trimlight app.
+      details['device-1'] = { ...details['device-1'], switchState: SwitchState.Manual };
+      await jest.advanceTimersByTimeAsync(15_000);
+      await expect(on.handleGetRequest()).resolves.toBe(false);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(client.notifyUpdateShadow).toHaveBeenCalledTimes(1);
+      expect(client.getDeviceDetail).toHaveBeenCalledTimes(1);
+      expect(on.value).toBe(true);
+      expect(log.info).toHaveBeenCalledWith('Front House is now on (manual)');
+      expect(client.listDevices).toHaveBeenCalledTimes(1);
+    });
+
+    it('throttles refreshes to one per 15 s per device, sharing one that is in flight', async () => {
+      await launch(createPlatform());
+      const on = lightbulbOn(registered[0]);
+      client.getDeviceDetail.mockClear();
+
+      // Startup just refreshed it, so an immediate read doesn't call again.
+      await on.handleGetRequest();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(client.getDeviceDetail).not.toHaveBeenCalled();
+
+      await jest.advanceTimersByTimeAsync(15_000);
+      await Promise.all([on.handleGetRequest(), on.handleGetRequest(), on.handleGetRequest()]);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(client.getDeviceDetail).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(5_000);
+      await on.handleGetRequest();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(client.getDeviceDetail).toHaveBeenCalledTimes(1);
+
+      await jest.advanceTimersByTimeAsync(10_000);
+      await on.handleGetRequest();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(client.getDeviceDetail).toHaveBeenCalledTimes(2);
+    });
+
+    it('waits for the controller to report in before reading its status', async () => {
+      const platform = new TrimlightPlatform(log, baseConfig, api, () => client, { notifySettleMs: 2_000 });
+      api.signalFinished();
+      await jest.advanceTimersByTimeAsync(0);
+      expect(client.notifyUpdateShadow).toHaveBeenCalledTimes(1);
+      expect(client.getDeviceDetail).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(1_999);
+      expect(client.getDeviceDetail).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(1);
+      expect(client.getDeviceDetail).toHaveBeenCalledTimes(1);
+      expect(registered).toHaveLength(1);
+      platform.stop();
+    });
+
+    it('runs the background check every 15 minutes by default', async () => {
+      await launch(createPlatform());
+      await jest.advanceTimersByTimeAsync(899_000);
+      expect(client.listDevices).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(1_000);
+      expect(client.listDevices).toHaveBeenCalledTimes(2);
+    });
+
+    it('can turn the background check off, still retrying a failed startup', async () => {
+      client.listDevices.mockRejectedValueOnce(new TrimlightApiError('Network error: ENOTFOUND'));
+      await launch(createPlatform({ ...baseConfig, pollingIntervalSeconds: 0 }));
+      await jest.advanceTimersByTimeAsync(30_000);
+      expect(client.listDevices).toHaveBeenCalledTimes(2);
+      expect(registered).toHaveLength(1);
+      await jest.advanceTimersByTimeAsync(24 * 3600_000);
+      expect(client.listDevices).toHaveBeenCalledTimes(2);
+    });
+
+    it('warns when an interval below the minimum is raised', () => {
+      createPlatform({ ...baseConfig, pollingIntervalSeconds: 30 });
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('using 60'));
+    });
+
+    it('notices a controller going offline when HomeKit looks at it', async () => {
+      await launch(createPlatform());
+      const on = lightbulbOn(registered[0]);
+      details['device-1'] = { ...details['device-1'], connectivity: 0 };
+      await jest.advanceTimersByTimeAsync(15_000);
+      await on.handleGetRequest();
+      await jest.advanceTimersByTimeAsync(0);
+      await expect(on.handleGetRequest()).rejects.toBe(api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      expect(log.info).toHaveBeenCalledWith('Front House is now offline');
+    });
+
+    describe('"off for tonight" restore checks the cloud first', () => {
+      const schedule = {
+        daily: [{ id: 0, enable: true, effectId: 7, repetition: 1, startTime: { hours: 18, minutes: 0 }, endTime: { hours: 21, minutes: 0 } }],
+        calendar: [],
+      };
+
+      const offDuringWindow = async () => {
+        jest.setSystemTime(new Date(2026, 9, 28, 19, 30));
+        setCloud(makeDevice({ switchState: SwitchState.Timer, ...schedule }));
+        // Mirror commands into the fake cloud like the real one.
+        client.setSwitchState.mockImplementation(async (id: string, state: SwitchState) => {
+          details[id] = { ...details[id], switchState: state };
+        });
+        await launch(createPlatform());
+        await lightbulbOn(registered[0]).handleSetRequest(false);
+        expect(details['device-1'].switchState).toBe(SwitchState.Off);
+        client.getDeviceDetail.mockClear();
+      };
+
+      it('restores timer mode after the window when the cloud still says off', async () => {
+        await offDuringWindow();
+        jest.setSystemTime(new Date(2026, 9, 28, 20, 59, 30));
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(client.getDeviceDetail).toHaveBeenCalledTimes(1);
+        expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Timer);
+        expect(details['device-1'].switchState).toBe(SwitchState.Timer);
+      });
+
+      it('does not override a change made in the Trimlight app meanwhile', async () => {
+        await offDuringWindow();
+        // Turned on in the Trimlight app at 20:00; Home wasn't open, so the
+        // plugin doesn't know yet.
+        details['device-1'] = { ...details['device-1'], switchState: SwitchState.Manual };
+        jest.setSystemTime(new Date(2026, 9, 28, 20, 59, 30));
+        await jest.advanceTimersByTimeAsync(60_000);
+        expect(client.getDeviceDetail).toHaveBeenCalledTimes(1);
+        expect(client.setSwitchState).toHaveBeenCalledTimes(1);
+        expect(details['device-1'].switchState).toBe(SwitchState.Manual);
+        expect(lightbulbOn(registered[0]).value).toBe(true);
+      });
     });
   });
 });

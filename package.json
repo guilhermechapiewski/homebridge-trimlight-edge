@@ -1,7 +1,7 @@
 {
   "name": "homebridge-trimlight-edge",
   "displayName": "Trimlight Edge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Homebridge plugin to control Trimlight Edge permanent lighting from Apple Home via the Trimlight cloud API.",
   "license": "ISC",
   "author": "Guilherme Chapiewski",

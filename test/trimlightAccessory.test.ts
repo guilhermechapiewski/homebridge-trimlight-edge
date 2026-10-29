@@ -52,15 +52,20 @@ describe('TrimlightAccessory', () => {
 
   const build = (device = makeDevice(), exposeAs: 'lightbulb' | 'switch' = 'lightbulb', accessory?: PlatformAccessory<TrimlightAccessoryContext>) => {
     const acc = accessory ?? makeAccessory(device);
-    const handler = new TrimlightAccessory({ api, log, client, exposeAs, commandCooldownMs: 10_000, now: () => clock }, acc);
+    const handler = new TrimlightAccessory({
+      api, log, client, exposeAs, commandCooldownMs: 10_000, now: () => clock, clockTickMs: 0, requestRefresh,
+    }, acc);
     const service = acc.getService(exposeAs === 'switch' ? Service.Switch : Service.Lightbulb)!;
     return { handler, accessory: acc, service, on: service.getCharacteristic(Characteristic.On) };
   };
+
+  let requestRefresh: jest.Mock<Promise<void>, [boolean?]> | undefined;
 
   beforeEach(() => {
     clock = 1_000_000;
     log = makeLogger();
     client = { setSwitchState: jest.fn().mockResolvedValue(undefined) };
+    requestRefresh = undefined;
   });
 
   describe('setup', () => {
@@ -370,6 +375,87 @@ describe('TrimlightAccessory', () => {
       second.handler.update(timerDevice({ switchState: SwitchState.Off }));
       await flush();
       expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Timer);
+    });
+  });
+  describe('refresh on read and the local clock', () => {
+    const schedule = {
+      daily: [{ id: 0, enable: true, effectId: 7, repetition: 1, startTime: { hours: 18, minutes: 0 }, endTime: { hours: 21, minutes: 0 } }],
+      calendar: [],
+    };
+    const time = (h: number, m = 0) => new Date(2026, 9, 28, h, m).getTime();
+
+    beforeEach(() => {
+      requestRefresh = jest.fn().mockResolvedValue(undefined);
+    });
+
+    it('asks for a background refresh on every HomeKit read, answering from cache', async () => {
+      const { on } = build(makeDevice({ switchState: SwitchState.Manual }));
+      await expect(on.handleGetRequest()).resolves.toBe(true);
+      expect(requestRefresh).toHaveBeenCalledWith();
+    });
+
+    it('still asks for a refresh while offline, so coming back is noticed', async () => {
+      const { on } = build(makeDevice({ connectivity: 0 }));
+      await expect(on.handleGetRequest()).rejects.toBe(HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+      expect(requestRefresh).toHaveBeenCalled();
+    });
+
+    it('flips at schedule boundaries on the clock tick and pushes to HomeKit', () => {
+      clock = time(17, 59);
+      const { handler, on } = build(makeDevice({ switchState: SwitchState.Timer, ...schedule }));
+      expect(on.value).toBe(false);
+      clock = time(18, 0);
+      handler.checkClock();
+      expect(on.value).toBe(true);
+      expect(log.info).toHaveBeenCalledWith('Front House is now on (timer schedule)');
+      clock = time(21, 0);
+      handler.checkClock();
+      expect(on.value).toBe(false);
+      expect(requestRefresh).not.toHaveBeenCalled();
+    });
+
+    it('asks for a forced refresh (not a blind restore) when "off for tonight" is due', async () => {
+      clock = time(19, 30);
+      const { handler, on } = build(makeDevice({ switchState: SwitchState.Timer, ...schedule }));
+      await on.handleSetRequest(false);
+      requestRefresh!.mockClear();
+      clock = time(20, 0);
+      handler.checkClock();
+      expect(requestRefresh).not.toHaveBeenCalled();
+      clock = time(21, 0);
+      handler.checkClock();
+      expect(requestRefresh).toHaveBeenCalledWith(true);
+      expect(client.setSwitchState).toHaveBeenCalledTimes(1);
+    });
+
+    it('does nothing on the clock tick during the command cooldown', async () => {
+      // Off at 20:59:58; the window ends 2 s later, inside the 10 s cooldown.
+      clock = time(21, 0) - 2_000;
+      const { handler, on } = build(makeDevice({ switchState: SwitchState.Timer, ...schedule }));
+      await on.handleSetRequest(false);
+      requestRefresh!.mockClear();
+      clock = time(21, 0) + 3_000;
+      handler.checkClock();
+      expect(requestRefresh).not.toHaveBeenCalled();
+      clock = time(21, 0) + 15_000;
+      handler.checkClock();
+      expect(requestRefresh).toHaveBeenCalledWith(true);
+    });
+
+    it('dispose stops the clock timer', () => {
+      jest.useFakeTimers();
+      try {
+        const acc = makeAccessory(makeDevice({ switchState: SwitchState.Timer, ...schedule }));
+        const handler = new TrimlightAccessory({ api, log, client, exposeAs: 'lightbulb', clockTickMs: 60_000 }, acc);
+        const spy = jest.spyOn(handler, 'checkClock');
+        jest.advanceTimersByTime(120_000);
+        expect(spy).toHaveBeenCalledTimes(2);
+        handler.dispose();
+        jest.advanceTimersByTime(120_000);
+        expect(spy).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
     });
   });
 });

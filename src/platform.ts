@@ -1,10 +1,14 @@
 import type { API, DynamicPlatformPlugin, Logger, PlatformAccessory, PlatformConfig } from 'homebridge';
 
 import {
+  CLOCK_TICK_MS,
   DEFAULT_POLLING_INTERVAL_SECONDS,
   MIN_POLLING_INTERVAL_SECONDS,
+  NOTIFY_SETTLE_MS,
+  ON_DEMAND_REFRESH_MIN_INTERVAL_MS,
   PLATFORM_NAME,
   PLUGIN_NAME,
+  POLL_RETRY_INITIAL_MS,
 } from './settings';
 import { DeviceState, ExposeAs, sanitizeName, TrimlightAccessory, TrimlightAccessoryContext } from './trimlightAccessory';
 import { TrimlightAuthError, TrimlightClient, TrimlightDevice } from './trimlightApi';
@@ -12,13 +16,24 @@ import { TrimlightAuthError, TrimlightClient, TrimlightDevice } from './trimligh
 export interface TrimlightPlatformConfig {
   clientId: string;
   clientSecret: string;
+  /** Background check interval; 0 means only at startup and on demand. */
   pollingIntervalSeconds: number;
   exposeAs: ExposeAs;
   /** Undocumented; lets tests point the plugin at a mock server. */
   baseUrl?: string;
 }
 
+/** Timing knobs, overridable in tests. */
+export interface PlatformTiming {
+  notifySettleMs: number;
+  refreshMinIntervalMs: number;
+  clockTickMs: number;
+  retryInitialMs: number;
+}
+
 type Client = Pick<TrimlightClient, 'listDevices' | 'getDeviceDetail' | 'setSwitchState' | 'notifyUpdateShadow'>;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 /** Validates the raw Homebridge config, returning a list of problems if invalid. */
 export function parseConfig(config: PlatformConfig): TrimlightPlatformConfig | string[] {
@@ -35,10 +50,11 @@ export function parseConfig(config: PlatformConfig): TrimlightPlatformConfig | s
   let pollingIntervalSeconds = DEFAULT_POLLING_INTERVAL_SECONDS;
   if (config.pollingIntervalSeconds !== undefined && config.pollingIntervalSeconds !== null && config.pollingIntervalSeconds !== '') {
     const parsed = Number(config.pollingIntervalSeconds);
-    if (!Number.isFinite(parsed) || parsed < MIN_POLLING_INTERVAL_SECONDS) {
-      errors.push(`"pollingIntervalSeconds" must be a number >= ${MIN_POLLING_INTERVAL_SECONDS}`);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      errors.push('"pollingIntervalSeconds" must be 0 (off) or a number of seconds');
     } else {
-      pollingIntervalSeconds = parsed;
+      // Short intervals from older versions are raised rather than rejected.
+      pollingIntervalSeconds = parsed === 0 ? 0 : Math.max(parsed, MIN_POLLING_INTERVAL_SECONDS);
     }
   }
 
@@ -63,6 +79,14 @@ export function parseConfig(config: PlatformConfig): TrimlightPlatformConfig | s
   };
 }
 
+/**
+ * Keeps HomeKit in sync with the Trimlight cloud without constant polling:
+ * - a full check (device list + status) at startup and every
+ *   `pollingIntervalSeconds` (default 15 min; 0 = off);
+ * - an on-demand status refresh whenever HomeKit reads an accessory (the Home
+ *   app, a widget or Siri looking at it), throttled per device;
+ * - schedule windows are tracked locally by each accessory (no API calls).
+ */
 export class TrimlightPlatform implements DynamicPlatformPlugin {
   /** Accessories restored from the Homebridge cache, keyed by UUID. */
   private readonly accessories = new Map<string, PlatformAccessory<TrimlightAccessoryContext>>();
@@ -70,11 +94,16 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
   private readonly handlers = new Map<string, TrimlightAccessory>();
   private readonly settings?: TrimlightPlatformConfig;
   private readonly client?: Client;
+  private readonly timing: PlatformTiming;
   private pollTimer?: NodeJS.Timeout;
+  private retryDelayMs: number;
   private stopped = false;
   private lastPollError?: string;
   /** Devices whose detail fetch is failing, so it's logged once per outage. */
   private readonly detailFailures = new Set<string>();
+  /** Per-device on-demand refresh bookkeeping, keyed by UUID. */
+  private readonly lastRefreshAt = new Map<string, number>();
+  private readonly refreshing = new Map<string, Promise<void>>();
 
   constructor(
     readonly log: Logger,
@@ -86,7 +115,17 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
       baseUrl: settings.baseUrl,
       debug: (message) => log.debug(message),
     }),
+    timing: Partial<PlatformTiming> = {},
   ) {
+    this.timing = {
+      notifySettleMs: NOTIFY_SETTLE_MS,
+      refreshMinIntervalMs: ON_DEMAND_REFRESH_MIN_INTERVAL_MS,
+      clockTickMs: CLOCK_TICK_MS,
+      retryInitialMs: POLL_RETRY_INITIAL_MS,
+      ...timing,
+    };
+    this.retryDelayMs = this.timing.retryInitialMs;
+
     const parsed = parseConfig(config);
     if (Array.isArray(parsed)) {
       this.log.error(`Invalid configuration, plugin disabled: ${parsed.join('; ')}`);
@@ -94,6 +133,11 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
     }
     this.settings = parsed;
     this.client = clientFactory(parsed);
+    const requested = Number(config.pollingIntervalSeconds);
+    if (requested > 0 && requested < MIN_POLLING_INTERVAL_SECONDS) {
+      this.log.warn(`pollingIntervalSeconds ${requested} is below the minimum; using ${MIN_POLLING_INTERVAL_SECONDS}. `
+        + 'Status is also refreshed whenever the Home app shows the accessory.');
+    }
 
     this.api.on('didFinishLaunching', () => {
       void this.poll();
@@ -113,13 +157,17 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
       clearTimeout(this.pollTimer);
       this.pollTimer = undefined;
     }
+    for (const handler of this.handlers.values()) {
+      handler.dispose();
+    }
   }
 
-  /** Fetches device state once, syncs accessories, and schedules the next poll. */
+  /** Full check: device list plus each device's status; schedules the next one. */
   async poll(): Promise<void> {
     if (this.stopped || !this.client || !this.settings) {
       return;
     }
+    let failed = false;
     try {
       const devices = await this.client.listDevices();
       const states: DeviceState[] = [];
@@ -135,10 +183,47 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
         this.lastPollError = undefined;
       }
     } catch (error) {
+      failed = true;
       this.reportPollError(error as Error);
     } finally {
-      this.scheduleNextPoll();
+      this.scheduleNextPoll(failed);
     }
+  }
+
+  /**
+   * Refreshes one device's status, e.g. because HomeKit just read it. Throttled
+   * per device (unless `force`) and coalesced with a refresh already running.
+   */
+  refreshDevice(uuid: string, force = false): Promise<void> {
+    const running = this.refreshing.get(uuid);
+    if (running) {
+      return running;
+    }
+    const now = Date.now();
+    if (!force && now - (this.lastRefreshAt.get(uuid) ?? 0) < this.timing.refreshMinIntervalMs) {
+      return Promise.resolve();
+    }
+    const accessory = this.accessories.get(uuid);
+    const handler = this.handlers.get(uuid);
+    if (this.stopped || !this.client || !accessory || !handler) {
+      return Promise.resolve();
+    }
+    this.lastRefreshAt.set(uuid, now);
+
+    const refresh = (async () => {
+      try {
+        const state = await this.readStatus(accessory.context.device);
+        if (!this.stopped && this.handlers.get(uuid) === handler) {
+          handler.update(state);
+        }
+      } catch (error) {
+        this.reportPollError(error as Error);
+      } finally {
+        this.refreshing.delete(uuid);
+      }
+    })();
+    this.refreshing.set(uuid, refresh);
+    return refresh;
   }
 
   /**
@@ -147,7 +232,8 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
    * controllers and failed fetches keep the last known values.
    */
   private async fetchState(device: TrimlightDevice): Promise<DeviceState> {
-    const previous = this.accessories.get(this.api.hap.uuid.generate(device.deviceId))?.context.device;
+    const uuid = this.api.hap.uuid.generate(device.deviceId);
+    const previous = this.accessories.get(uuid)?.context.device;
     const carried: DeviceState = {
       ...device,
       switchState: device.switchState ?? previous?.switchState,
@@ -157,40 +243,71 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
     if (device.connectivity !== 1) {
       return carried;
     }
+    this.lastRefreshAt.set(uuid, Date.now());
+    return this.readStatus(carried);
+  }
 
-    // Ask the controller to report in; the cloud can otherwise serve stale data.
-    await this.client!.notifyUpdateShadow(device.deviceId);
+  /**
+   * Asks the controller to report in, gives it a moment, then reads the
+   * detail. Reading immediately can return the state from before the latest
+   * change. Credential errors propagate; other failures keep `base`.
+   */
+  private async readStatus(base: DeviceState): Promise<DeviceState> {
+    const client = this.client!;
+    await client.notifyUpdateShadow(base.deviceId);
+    if (this.timing.notifySettleMs > 0) {
+      await sleep(this.timing.notifySettleMs);
+    }
     try {
-      const detail = await this.client!.getDeviceDetail(device.deviceId);
-      if (this.detailFailures.delete(device.deviceId)) {
-        this.log.info(`Status of ${device.name} is available again`);
+      const detail = await client.getDeviceDetail(base.deviceId);
+      if (this.detailFailures.delete(base.deviceId)) {
+        this.log.info(`Status of ${base.name} is available again`);
       }
       return {
-        ...device,
-        switchState: typeof detail.switchState === 'number' ? detail.switchState : carried.switchState,
-        daily: Array.isArray(detail.daily) ? detail.daily : carried.daily,
-        calendar: Array.isArray(detail.calendar) ? detail.calendar : carried.calendar,
+        ...base,
+        switchState: typeof detail.switchState === 'number' ? detail.switchState : base.switchState,
+        connectivity: typeof detail.connectivity === 'number' ? detail.connectivity : base.connectivity,
+        daily: Array.isArray(detail.daily) ? detail.daily : base.daily,
+        calendar: Array.isArray(detail.calendar) ? detail.calendar : base.calendar,
       };
     } catch (error) {
       if (error instanceof TrimlightAuthError) {
         throw error;
       }
-      const message = `Unable to read the status of ${device.name}: ${(error as Error).message}`;
-      if (this.detailFailures.has(device.deviceId)) {
+      const message = `Unable to read the status of ${base.name}: ${(error as Error).message}`;
+      if (this.detailFailures.has(base.deviceId)) {
         this.log.debug(message);
       } else {
-        this.detailFailures.add(device.deviceId);
+        this.detailFailures.add(base.deviceId);
         this.log.warn(`${message} (keeping the last known state)`);
       }
-      return carried;
+      return base;
     }
   }
 
-  private scheduleNextPoll(): void {
+  /**
+   * After a failure, retries sooner (30 s doubling up to the interval, or up
+   * to 15 min when background checks are off) so a network hiccup at startup
+   * doesn't leave accessories stale for long.
+   */
+  private scheduleNextPoll(failed: boolean): void {
     if (this.stopped || !this.settings) {
       return;
     }
-    this.pollTimer = setTimeout(() => void this.poll(), this.settings.pollingIntervalSeconds * 1000);
+    const intervalMs = this.settings.pollingIntervalSeconds * 1000;
+    let delay: number;
+    if (failed) {
+      const cap = intervalMs || DEFAULT_POLLING_INTERVAL_SECONDS * 1000;
+      delay = Math.min(this.retryDelayMs, cap);
+      this.retryDelayMs = Math.min(this.retryDelayMs * 2, cap);
+    } else {
+      this.retryDelayMs = this.timing.retryInitialMs;
+      if (!intervalMs) {
+        return;
+      }
+      delay = intervalMs;
+    }
+    this.pollTimer = setTimeout(() => void this.poll(), delay);
     // Don't keep the process alive just for polling.
     this.pollTimer.unref?.();
   }
@@ -252,6 +369,7 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
     }
     for (const accessory of stale) {
       this.log.info(`Removing ${accessory.displayName}: no longer on the Trimlight account`);
+      this.handlers.get(accessory.UUID)?.dispose();
       this.accessories.delete(accessory.UUID);
       this.handlers.delete(accessory.UUID);
     }
@@ -264,6 +382,8 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
       log: this.log,
       client: this.client!,
       exposeAs: this.settings!.exposeAs,
+      requestRefresh: (force) => this.refreshDevice(accessory.UUID, force),
+      clockTickMs: this.timing.clockTickMs,
     }, accessory);
   }
 }
