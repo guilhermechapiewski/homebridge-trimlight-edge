@@ -86,6 +86,7 @@ Things to know:
 
 - **"Trimlight rejected the API credentials"**: double-check `clientId`/`clientSecret`. These are API credentials (see [Getting your API credentials](#getting-your-api-credentials)), not your app login.
 - **Accessory shows "No Response"**: the controller is offline according to the Trimlight cloud (check its Wi-Fi), or the last command failed. Details are in the HOOBS/Homebridge log.
+- **HOOBS shows "0 plugins installed" / no settings form right after a release**: the HOOBS app takes plugin details from its own plugin directory, which picks up new npm releases with a delay. The plugin still runs. To enter your credentials meanwhile, run [`scripts/hoobs-set-credentials.js`](scripts/hoobs-set-credentials.js) on the HOOBS box (`node hoobs-set-credentials.js <bridge-id>`; bridge ids are listed in `/var/lib/hoobs/bridges.conf`). Log in with your HOOBS **username** from the Profiles page, not your email. Then restart the bridge.
 - **Status takes a while to update after using the Trimlight app**: changes made outside Apple Home are picked up on the next refresh (`pollingIntervalSeconds`).
 
 ## Development
