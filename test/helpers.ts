@@ -2,7 +2,7 @@ import http from 'http';
 import { AddressInfo } from 'net';
 import type { Logger } from 'homebridge';
 
-import { TrimlightDevice } from '../src/trimlightApi';
+import { DeviceState } from '../src/trimlightAccessory';
 
 export interface RecordedRequest {
   method: string;
@@ -87,7 +87,7 @@ export function makeLogger(): jest.Mocked<Logger> {
   return log;
 }
 
-export function makeDevice(overrides: Partial<TrimlightDevice> = {}): TrimlightDevice {
+export function makeDevice(overrides: Partial<DeviceState> = {}): DeviceState {
   return {
     deviceId: 'device-1',
     name: 'Front House',

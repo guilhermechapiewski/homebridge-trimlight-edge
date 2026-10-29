@@ -10,7 +10,7 @@ Every Trimlight Edge controller on your account appears in Apple Home as a light
 - On/off from Apple Home, Siri, scenes and automations
 - Status stays in sync when lights are changed from the Trimlight app or by a schedule (polled every 30 s by default)
 - Controllers that are offline show as **No Response** instead of a wrong state
-- Respects your Trimlight schedules: turning on a light that is already lit by its timer schedule leaves the schedule alone
+- Understands Trimlight timer schedules: shows on only while a schedule window is active, "turn on" never interrupts a running schedule, and "turn off" only lasts until the current window ends (your schedule keeps running the next day)
 - No runtime dependencies; works on the older Node.js/Homebridge versions found on HOOBS boxes
 
 ## Requirements
@@ -71,15 +71,23 @@ After restarting you should see something like:
 
 ## How on/off maps to Trimlight
 
-Trimlight controllers have three switch states: **off**, **manual** and **timer** (running a schedule).
+Trimlight controllers have three switch states: **off**, **manual** and **timer** (running your daily/calendar schedules).
 
 | Apple Home | Trimlight |
 | :--- | :--- |
-| Turn **off** | Sets the controller to **off** |
-| Turn **on** (when off) | Sets the controller to **manual**, which resumes the last effect |
-| Shows **on** | Controller is in **manual** or **timer** mode |
+| Shows **on** | Manual mode, or timer mode **while a schedule window is active** |
+| Shows **off** | Off, or timer mode **outside** its schedule windows |
+| Turn **on** while it's already lit | Nothing is sent, so a running schedule is left alone |
+| Turn **on** while it's dark | Switches to **manual**, which resumes the last effect |
+| Turn **off** during a schedule window | Turns **off now**; the plugin switches back to **timer** mode once the window ends, so the next scheduled window (e.g. tomorrow evening) runs as usual |
+| Turn **off** at any other time | If the controller normally runs on a schedule, switches straight back to **timer** mode (dark outside its windows); otherwise switches to **off** |
 
-**Known limitation:** in timer mode the Trimlight cloud reports "timer" even during hours when the schedule has the lights dark, so Apple Home shows the light as **on** for the whole time timer mode is active. Turning it off from Apple Home switches the controller to **off**, which also disables the schedule until you re-enable it in the Trimlight app.
+Things to know:
+
+- The plugin treats a controller as "running on a schedule" once it has seen it in timer mode. This survives Homebridge/HOOBS restarts.
+- If you switch the controller to off or manual **in the Trimlight app**, the plugin treats that as your choice and stops restoring the schedule until it sees timer mode again.
+- The switch back to timer mode happens on the first status refresh after the window ends (within `pollingIntervalSeconds`). Lights stay off in between.
+- Schedule windows are evaluated using the Homebridge/HOOBS device's clock and time zone, so make sure it matches your house.
 
 ## Troubleshooting
 

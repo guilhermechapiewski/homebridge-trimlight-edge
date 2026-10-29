@@ -47,7 +47,26 @@ function createMockCloud({ clientId, clientSecret, devices }) {
 
       const find = () => state.devices.find((d) => d.deviceId === body.deviceId);
       if (req.method === 'GET' && path === '/trimlight/v1/oauth/resources/devices') {
-        return reply(res, 200, { code: 0, desc: 'success', payload: { total: state.devices.length, current: 0, data: state.devices } });
+        // Like the real cloud: the list carries no switch state or schedules.
+        const data = state.devices.map((d) => ({
+          deviceId: d.deviceId, name: d.name, connectivity: d.connectivity, state: d.state, fwVersionName: d.fwVersionName,
+        }));
+        return reply(res, 200, { code: 0, desc: 'success', payload: { total: data.length, current: 0, data } });
+      }
+      if (req.method === 'POST' && path === '/trimlight/v1/oauth/resources/device/get') {
+        const device = find();
+        if (!device) {
+          return reply(res, 200, { code: 10001, desc: 'no device' });
+        }
+        return reply(res, 200, {
+          code: 0,
+          desc: 'success',
+          payload: {
+            name: device.name, switchState: device.switchState, connectivity: device.connectivity, state: device.state,
+            colorOrder: 0, ic: 0, fwVersionName: '1.17.77', effects: [], combinedEffect: { effectIds: [], interval: 5 },
+            daily: device.daily || [], calendar: device.calendar || [], currentEffect: {}, overlayEffects: [],
+          },
+        });
       }
       if (req.method === 'GET' && path === '/trimlight/v1/oauth/resources/device/notify-update-shadow') {
         return find() ? reply(res, 200, { code: 0, desc: 'success' }) : reply(res, 200, { code: 10001, desc: 'no device' });

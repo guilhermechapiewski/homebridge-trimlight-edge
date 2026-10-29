@@ -14,8 +14,9 @@
  *   ... node scripts/trimlight-cli.js detail <deviceId>
  */
 const { SwitchState, TrimlightClient } = require('../dist/trimlightApi');
+const { isLit } = require('../dist/trimlightAccessory');
 
-const SWITCH_NAMES = { 0: 'off', 1: 'manual (on)', 2: 'timer' };
+const SWITCH_NAMES = { 0: 'off', 1: 'manual', 2: 'timer' };
 
 async function main() {
   const [command, deviceId] = process.argv.slice(2);
@@ -41,7 +42,14 @@ async function main() {
       console.log('No devices on this account.');
     }
     for (const d of devices) {
-      console.log(`${d.deviceId}  "${d.name}"  ${SWITCH_NAMES[d.switchState] ?? d.switchState}  ${d.connectivity === 1 ? 'online' : 'OFFLINE'}  fw ${d.fwVersionName ?? '?'}`);
+      // The list has no switch state; it only comes with the device detail.
+      let status = 'status unknown (offline)';
+      if (d.connectivity === 1) {
+        const detail = await client.getDeviceDetail(d.deviceId);
+        const lit = isLit({ ...d, ...detail }, new Date()) ? 'lit' : 'dark';
+        status = `${SWITCH_NAMES[detail.switchState] ?? detail.switchState} -> ${lit} now`;
+      }
+      console.log(`${d.deviceId}  "${d.name}"  ${status}  ${d.connectivity === 1 ? 'online' : 'OFFLINE'}  fw ${d.fwVersionName ?? '?'}`);
     }
     return;
   }

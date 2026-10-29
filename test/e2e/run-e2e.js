@@ -27,6 +27,15 @@ const LIGHTBULB_TYPE = '00000043-0000-1000-8000-0026BB765291';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** An every-day schedule window from `fromMin` to `toMin` minutes relative to now. */
+function dailyWindow(fromMin, toMin) {
+  const at = (offset) => {
+    const d = new Date(Date.now() + offset * 60000);
+    return { hours: d.getHours(), minutes: d.getMinutes() };
+  };
+  return { id: 0, enable: true, effectId: 1, repetition: 1, startTime: at(fromMin), endTime: at(toMin) };
+}
+
 function hap(port, method, urlPath, body) {
   return new Promise((resolve, reject) => {
     const data = body ? Buffer.from(JSON.stringify(body)) : undefined;
@@ -191,9 +200,62 @@ async function main() {
 
     // Changed outside HomeKit (e.g. from the Trimlight app). Wait past the
     // post-command cooldown plus one poll.
-    state.devices[0].switchState = 2;
+    state.devices[0].switchState = 1;
     await waitFor('external change to reach HomeKit', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
-    step('state changed in the Trimlight app (timer mode) shows as on via polling');
+    step('turning on in the Trimlight app shows as on via polling');
+
+    // Timer mode: lit only inside a schedule window. Windows are built around
+    // the current time so the test doesn't depend on when it runs.
+    state.devices[0].switchState = 2;
+    state.devices[0].daily = [dailyWindow(120, 180)];
+    await waitFor('timer mode outside its window to show off', async () => (await readOn(hapPort, aid, iid)).value === false, 30000);
+    step('timer mode outside its schedule window shows as off');
+
+    state.devices[0].daily = [dailyWindow(-60, 60)];
+    await waitFor('timer mode inside its window to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
+    step('timer mode inside its schedule window shows as on');
+
+    const commandsBefore = state.requests.filter((r) => r.path.endsWith('/device/update')).length;
+    res = await hap(hapPort, 'PUT', '/characteristics', { characteristics: [{ aid, iid, value: true }] });
+    assert.ok(res.status === 204 || res.status === 207, `unexpected status ${res.status}`);
+    assert.strictEqual(state.requests.filter((r) => r.path.endsWith('/device/update')).length, commandsBefore);
+    assert.strictEqual(state.devices[0].switchState, 2);
+    step('"turn on" while the schedule has it lit leaves timer mode alone');
+
+    state.devices[0].daily = [dailyWindow(120, 180)];
+    await waitFor('timer mode back outside its window', async () => (await readOn(hapPort, aid, iid)).value === false, 30000);
+    res = await hap(hapPort, 'PUT', '/characteristics', { characteristics: [{ aid, iid, value: true }] });
+    assert.ok(res.status === 204 || res.status === 207, `unexpected status ${res.status}`);
+    assert.strictEqual(state.devices[0].switchState, 1);
+    assert.strictEqual((await readOn(hapPort, aid, iid)).value, true);
+    step('"turn on" while the schedule has it dark switches to manual and lights up');
+
+    // "Off for tonight": off outside a window goes straight back to timer mode.
+    res = await hap(hapPort, 'PUT', '/characteristics', { characteristics: [{ aid, iid, value: false }] });
+    assert.ok(res.status === 204 || res.status === 207, `unexpected status ${res.status}`);
+    assert.strictEqual(state.devices[0].switchState, 2);
+    assert.strictEqual((await readOn(hapPort, aid, iid)).value, false);
+    step('"turn off" outside the schedule window returns to timer mode (schedule kept)');
+
+    // Off during a window that ends at the next minute: off now, then timer
+    // mode is restored by the plugin once the window is over.
+    state.devices[0].daily = [dailyWindow(-60, 2)];
+    await waitFor('timer window to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
+    res = await hap(hapPort, 'PUT', '/characteristics', { characteristics: [{ aid, iid, value: false }] });
+    assert.ok(res.status === 204 || res.status === 207, `unexpected status ${res.status}`);
+    assert.strictEqual(state.devices[0].switchState, 0);
+    step('"turn off" during the schedule window turns the lights off now');
+    await waitFor('timer mode to be restored after the window ends', async () => state.devices[0].switchState === 2, 180000);
+    assert.strictEqual((await readOn(hapPort, aid, iid)).value, false);
+    assert.ok(hb.output.includes('schedule window over, timer schedule restored'), 'restore was not logged');
+    step('timer schedule is restored automatically once the window ends');
+
+    state.devices[0].switchState = 1;
+    await waitFor('manual mode to show on', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
+
+    const detailReads = state.requests.filter((r) => r.path.endsWith('/device/get'));
+    assert.ok(detailReads.length > 0 && detailReads.every((r) => r.body.deviceId === DEVICE_ID && r.body.currentDate), 'detail reads must carry deviceId and currentDate');
+    step('state is read from the device detail endpoint');
 
     state.devices[0].connectivity = 0;
     await waitFor('offline controller to show No Response', async () => (await readOn(hapPort, aid, iid)).status === -70402, 20000);
@@ -201,6 +263,19 @@ async function main() {
     state.devices[0].connectivity = 1;
     await waitFor('controller to come back', async () => (await readOn(hapPort, aid, iid)).value === true, 20000);
     step('controller coming back online recovers');
+
+    // Restart in the middle of "off for tonight": the pending schedule
+    // restore must survive because Homebridge persisted the context to disk.
+    // Show a dark window first so we know the plugin has seen timer mode
+    // (it was in manual mode, which already reads as on).
+    state.devices[0].switchState = 2;
+    state.devices[0].daily = [dailyWindow(120, 180)];
+    await waitFor('timer mode (dark) to be seen before restart', async () => (await readOn(hapPort, aid, iid)).value === false, 30000);
+    state.devices[0].daily = [dailyWindow(-60, 2)];
+    await waitFor('timer window to show on before restart', async () => (await readOn(hapPort, aid, iid)).value === true, 30000);
+    res = await hap(hapPort, 'PUT', '/characteristics', { characteristics: [{ aid, iid, value: false }] });
+    assert.ok(res.status === 204 || res.status === 207, `unexpected status ${res.status}`);
+    assert.strictEqual(state.devices[0].switchState, 0);
 
     // Restart: the accessory must be restored from cache, not re-added.
     await stopHomebridge(hb);
@@ -211,6 +286,10 @@ async function main() {
     const after = await findOnCharacteristic(hapPort);
     assert.strictEqual(after.aid, aid, 'accessory id changed across restart (Home app would lose it)');
     step('restart restores the cached accessory with the same identity');
+
+    await waitFor('pending schedule restore to survive the restart', async () => state.devices[0].switchState === 2, 180000);
+    assert.ok(hb.output.includes('schedule window over, timer schedule restored'), 'restore after restart was not logged');
+    step('"off for tonight" survives a Homebridge restart and still restores the schedule');
 
     // Bad credentials are reported clearly.
     await stopHomebridge(hb);
@@ -229,6 +308,15 @@ async function main() {
     console.log('\nE2E PASSED');
   } catch (error) {
     console.error('\nE2E FAILED:', error.message);
+    const cacheFile = path.join(storageDir, 'accessories', 'cachedAccessories');
+    if (fs.existsSync(cacheFile)) {
+      const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+      console.error('--- Cached accessory contexts ---\n' + JSON.stringify(cached.map((a) => {
+        const { device, ...rest } = a.context || {};
+        return { displayName: a.displayName, ...rest, switchState: device && device.switchState };
+      }), null, 2));
+    }
+    console.error('--- Mock cloud state ---\n' + JSON.stringify(state.devices, null, 2));
     console.error('--- Homebridge output ---\n' + hb.output);
     process.exitCode = 1;
   } finally {

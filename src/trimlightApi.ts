@@ -3,6 +3,8 @@ import http from 'http';
 import https from 'https';
 import { URL } from 'url';
 
+import type { CalendarSchedule, DailySchedule } from './schedule';
+
 export const DEFAULT_BASE_URL = 'https://trimlight.ledhue.com/trimlight';
 
 /** Device switch state as reported/accepted by the Trimlight API. */
@@ -21,15 +23,29 @@ export const AUTH_ERROR_CODE = 10001;
  */
 export const RATE_LIMIT_ERROR_CODE = 20000;
 
+/** A device as returned by the device list endpoint. */
 export interface TrimlightDevice {
   deviceId: string;
   name: string;
-  switchState: number;
   /** 0: offline, 1: online. */
   connectivity: number;
   /** 0: normal, 1: upgrading. */
   state: number;
   fwVersionName?: string;
+  /**
+   * Documented as part of the list response, but the real cloud omits it;
+   * the authoritative value comes from the device detail.
+   */
+  switchState?: number;
+}
+
+/** The subset of the device detail response this plugin uses. */
+export interface TrimlightDeviceDetail {
+  switchState?: number;
+  connectivity?: number;
+  daily?: DailySchedule[];
+  calendar?: CalendarSchedule[];
+  [key: string]: unknown;
 }
 
 /** Date format the API expects for `currentDate` fields. */
@@ -190,8 +206,8 @@ export class TrimlightClient {
   }
 
   /** Returns the full device detail (switch state, effects, schedules, ...). */
-  async getDeviceDetail(deviceId: string): Promise<Record<string, unknown>> {
-    const payload = await this.request<Record<string, unknown>>('POST', 'v1/oauth/resources/device/get', {
+  async getDeviceDetail(deviceId: string): Promise<TrimlightDeviceDetail> {
+    const payload = await this.request<TrimlightDeviceDetail>('POST', 'v1/oauth/resources/device/get', {
       deviceId,
       currentDate: toTrimlightDate(this.now()),
     });

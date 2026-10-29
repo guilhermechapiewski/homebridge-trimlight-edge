@@ -6,7 +6,7 @@ import {
   PLATFORM_NAME,
   PLUGIN_NAME,
 } from './settings';
-import { ExposeAs, sanitizeName, TrimlightAccessory, TrimlightAccessoryContext } from './trimlightAccessory';
+import { DeviceState, ExposeAs, sanitizeName, TrimlightAccessory, TrimlightAccessoryContext } from './trimlightAccessory';
 import { TrimlightAuthError, TrimlightClient, TrimlightDevice } from './trimlightApi';
 
 export interface TrimlightPlatformConfig {
@@ -18,7 +18,7 @@ export interface TrimlightPlatformConfig {
   baseUrl?: string;
 }
 
-type Client = Pick<TrimlightClient, 'listDevices' | 'setSwitchState' | 'notifyUpdateShadow'>;
+type Client = Pick<TrimlightClient, 'listDevices' | 'getDeviceDetail' | 'setSwitchState' | 'notifyUpdateShadow'>;
 
 /** Validates the raw Homebridge config, returning a list of problems if invalid. */
 export function parseConfig(config: PlatformConfig): TrimlightPlatformConfig | string[] {
@@ -73,6 +73,8 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
   private pollTimer?: NodeJS.Timeout;
   private stopped = false;
   private lastPollError?: string;
+  /** Devices whose detail fetch is failing, so it's logged once per outage. */
+  private readonly detailFailures = new Set<string>();
 
   constructor(
     readonly log: Logger,
@@ -120,21 +122,67 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
     }
     try {
       const devices = await this.client.listDevices();
-      this.syncAccessories(devices);
+      const states: DeviceState[] = [];
+      for (const device of devices) {
+        if (this.stopped) {
+          return;
+        }
+        states.push(await this.fetchState(device));
+      }
+      this.syncAccessories(states);
       if (this.lastPollError) {
         this.log.info('Connection to the Trimlight cloud restored');
         this.lastPollError = undefined;
-      }
-      // Ask online controllers to report fresh state for the next poll.
-      for (const device of devices) {
-        if (device.connectivity === 1 && !this.stopped) {
-          await this.client.notifyUpdateShadow(device.deviceId);
-        }
       }
     } catch (error) {
       this.reportPollError(error as Error);
     } finally {
       this.scheduleNextPoll();
+    }
+  }
+
+  /**
+   * The device list carries no switch state, so on/off (and the schedules
+   * that decide it in timer mode) come from the device detail. Offline
+   * controllers and failed fetches keep the last known values.
+   */
+  private async fetchState(device: TrimlightDevice): Promise<DeviceState> {
+    const previous = this.accessories.get(this.api.hap.uuid.generate(device.deviceId))?.context.device;
+    const carried: DeviceState = {
+      ...device,
+      switchState: device.switchState ?? previous?.switchState,
+      daily: previous?.daily,
+      calendar: previous?.calendar,
+    };
+    if (device.connectivity !== 1) {
+      return carried;
+    }
+
+    // Ask the controller to report in; the cloud can otherwise serve stale data.
+    await this.client!.notifyUpdateShadow(device.deviceId);
+    try {
+      const detail = await this.client!.getDeviceDetail(device.deviceId);
+      if (this.detailFailures.delete(device.deviceId)) {
+        this.log.info(`Status of ${device.name} is available again`);
+      }
+      return {
+        ...device,
+        switchState: typeof detail.switchState === 'number' ? detail.switchState : carried.switchState,
+        daily: Array.isArray(detail.daily) ? detail.daily : carried.daily,
+        calendar: Array.isArray(detail.calendar) ? detail.calendar : carried.calendar,
+      };
+    } catch (error) {
+      if (error instanceof TrimlightAuthError) {
+        throw error;
+      }
+      const message = `Unable to read the status of ${device.name}: ${(error as Error).message}`;
+      if (this.detailFailures.has(device.deviceId)) {
+        this.log.debug(message);
+      } else {
+        this.detailFailures.add(device.deviceId);
+        this.log.warn(`${message} (keeping the last known state)`);
+      }
+      return carried;
     }
   }
 
@@ -161,7 +209,7 @@ export class TrimlightPlatform implements DynamicPlatformPlugin {
     }
   }
 
-  private syncAccessories(devices: TrimlightDevice[]): void {
+  private syncAccessories(devices: DeviceState[]): void {
     const seen = new Set<string>();
 
     for (const device of devices) {

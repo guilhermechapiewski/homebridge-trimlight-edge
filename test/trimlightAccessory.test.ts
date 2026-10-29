@@ -1,8 +1,9 @@
 import type { PlatformAccessory } from 'homebridge';
 import { HomebridgeAPI } from 'homebridge/lib/api';
 
-import { sanitizeName, TrimlightAccessory, TrimlightAccessoryContext } from '../src/trimlightAccessory';
-import { SwitchState, TrimlightDevice } from '../src/trimlightApi';
+import { isLit, sanitizeName, TrimlightAccessory, TrimlightAccessoryContext } from '../src/trimlightAccessory';
+import { SwitchState } from '../src/trimlightApi';
+import type { DeviceState } from '../src/trimlightAccessory';
 import { makeDevice, makeLogger } from './helpers';
 
 describe('sanitizeName', () => {
@@ -18,6 +19,23 @@ describe('sanitizeName', () => {
   });
 });
 
+describe('isLit', () => {
+  const noon = new Date(2026, 9, 28, 12, 0);
+  const evening = new Date(2026, 9, 28, 19, 0);
+  const schedule = { daily: [{ enable: true, repetition: 1, startTime: { hours: 18, minutes: 0 }, endTime: { hours: 21, minutes: 0 } }] };
+
+  it.each([
+    ['unknown state', { switchState: undefined }, noon, false],
+    ['off', { switchState: SwitchState.Off }, evening, false],
+    ['manual', { switchState: SwitchState.Manual }, noon, true],
+    ['timer, outside its window', { switchState: SwitchState.Timer, ...schedule }, noon, false],
+    ['timer, inside its window', { switchState: SwitchState.Timer, ...schedule }, evening, true],
+    ['timer, no usable schedule (assume lit)', { switchState: SwitchState.Timer, daily: [] }, noon, true],
+  ])('%s', (_label, state, now, expected) => {
+    expect(isLit(makeDevice(state as Partial<DeviceState>), now)).toBe(expected);
+  });
+});
+
 describe('TrimlightAccessory', () => {
   const api = new HomebridgeAPI();
   const { Service, Characteristic, HapStatusError, HAPStatus } = api.hap;
@@ -26,7 +44,7 @@ describe('TrimlightAccessory', () => {
   let log: ReturnType<typeof makeLogger>;
   let client: { setSwitchState: jest.Mock<Promise<void>, [string, SwitchState]> };
 
-  const makeAccessory = (device: TrimlightDevice) => {
+  const makeAccessory = (device: DeviceState) => {
     const accessory = new api.platformAccessory<TrimlightAccessoryContext>(device.name, api.hap.uuid.generate(device.deviceId));
     accessory.context.device = device;
     return accessory;
@@ -183,6 +201,175 @@ describe('TrimlightAccessory', () => {
       handler.update(makeDevice({ switchState: SwitchState.Manual, connectivity: 1 }));
       await expect(on.handleGetRequest()).resolves.toBe(true);
       expect(log.info).toHaveBeenCalledWith('Front House is now online');
+    });
+  });
+  describe('"off for tonight" with a timer schedule', () => {
+    // The user's real schedule: lit 18:00-21:00 every day.
+    const schedule = {
+      daily: [{ id: 0, enable: true, effectId: 7, repetition: 1, startTime: { hours: 18, minutes: 0 }, endTime: { hours: 21, minutes: 0 } }],
+      calendar: [],
+    };
+    const timerDevice = (overrides: Partial<DeviceState> = {}) => makeDevice({ switchState: SwitchState.Timer, ...schedule, ...overrides });
+    const time = (h: number, m = 0) => new Date(2026, 9, 28, h, m).getTime();
+    /** Lets the fire-and-forget restore promise settle. */
+    const flush = () => new Promise((resolve) => setImmediate(resolve));
+    let persisted: jest.SpyInstance;
+
+    beforeEach(() => {
+      persisted = jest.spyOn(api, 'updatePlatformAccessories');
+    });
+
+    afterEach(() => {
+      persisted.mockRestore();
+    });
+
+    it('learns that a controller seen in timer mode follows its schedule', () => {
+      const { accessory } = build(timerDevice());
+      expect(accessory.context.followsSchedule).toBe(true);
+    });
+
+    it('turning off during the window sends off, then restores timer mode once the window ends', async () => {
+      clock = time(19, 30);
+      const { handler, on, accessory } = build(timerDevice());
+      await expect(on.handleGetRequest()).resolves.toBe(true);
+
+      await on.handleSetRequest(false);
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Off);
+      expect(log.info).toHaveBeenCalledWith(expect.stringContaining('resumes once the current schedule window ends'));
+      expect(accessory.context.commandedState).toBe(SwitchState.Off);
+      expect(persisted).toHaveBeenCalledWith([accessory]);
+
+      // Still inside the window: stays off, no restore yet.
+      clock = time(20, 30);
+      handler.update(timerDevice({ switchState: SwitchState.Off }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenCalledTimes(1);
+      await expect(on.handleGetRequest()).resolves.toBe(false);
+
+      // Window over: back to timer mode, still dark.
+      clock = time(21, 0);
+      handler.update(timerDevice({ switchState: SwitchState.Off }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Timer);
+      expect(accessory.context.device.switchState).toBe(SwitchState.Timer);
+      expect(accessory.context.commandedState).toBeUndefined();
+      expect(accessory.context.followsSchedule).toBe(true);
+      await expect(on.handleGetRequest()).resolves.toBe(false);
+      expect(log.info).toHaveBeenCalledWith('Front House: schedule window over, timer schedule restored');
+
+      // Tomorrow evening the schedule lights it again.
+      clock = time(21, 0) + 21 * 3600_000;
+      handler.update(timerDevice());
+      await expect(on.handleGetRequest()).resolves.toBe(true);
+      expect(client.setSwitchState).toHaveBeenCalledTimes(2);
+    });
+
+    it('turning off after "on" outside the window goes straight back to timer mode', async () => {
+      clock = time(12, 0);
+      const { on, accessory } = build(timerDevice());
+      await on.handleSetRequest(true);
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Manual);
+      expect(accessory.context.followsSchedule).toBe(true);
+
+      await on.handleSetRequest(false);
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Timer);
+      expect(accessory.context.device.switchState).toBe(SwitchState.Timer);
+      await expect(on.handleGetRequest()).resolves.toBe(false);
+    });
+
+    it('retries a failed restore on the next refresh', async () => {
+      clock = time(19, 30);
+      const { handler, on } = build(timerDevice());
+      await on.handleSetRequest(false);
+
+      client.setSwitchState.mockRejectedValueOnce(new Error('cloud down'));
+      clock = time(21, 1);
+      handler.update(timerDevice({ switchState: SwitchState.Off }));
+      await flush();
+      expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('cloud down'));
+
+      clock = time(21, 2);
+      handler.update(timerDevice({ switchState: SwitchState.Off }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Timer);
+      expect(client.setSwitchState).toHaveBeenCalledTimes(3);
+    });
+
+    it('does not restore while the controller is offline', async () => {
+      clock = time(19, 30);
+      const { handler, on } = build(timerDevice());
+      await on.handleSetRequest(false);
+      clock = time(21, 1);
+      handler.update(timerDevice({ switchState: SwitchState.Off, connectivity: 0 }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancels the restore when the mode is changed in the Trimlight app', async () => {
+      clock = time(19, 30);
+      const { handler, on, accessory } = build(timerDevice());
+      await on.handleSetRequest(false);
+
+      clock = time(20, 0);
+      handler.update(timerDevice({ switchState: SwitchState.Manual }));
+      expect(accessory.context.followsSchedule).toBe(false);
+      expect(log.info).toHaveBeenCalledWith(expect.stringContaining('switched to manual outside Apple Home'));
+
+      clock = time(21, 30);
+      handler.update(timerDevice({ switchState: SwitchState.Off }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenCalledTimes(1);
+    });
+
+    it('cancels the restore when turned back on from Apple Home', async () => {
+      clock = time(19, 30);
+      const { handler, on } = build(timerDevice());
+      await on.handleSetRequest(false);
+      clock = time(19, 45);
+      await on.handleSetRequest(true);
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Manual);
+
+      clock = time(21, 30);
+      handler.update(timerDevice({ switchState: SwitchState.Manual }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenCalledTimes(2);
+      await expect(on.handleGetRequest()).resolves.toBe(true);
+    });
+
+    it('ignores polls during the command cooldown for restore decisions', async () => {
+      // Off at 20:59:58; the window ends 2s later, inside the 10s cooldown.
+      clock = time(21, 0) - 2_000;
+      const { handler, on } = build(timerDevice());
+      await on.handleSetRequest(false);
+      clock = time(21, 0) + 3_000;
+      handler.update(timerDevice({ switchState: SwitchState.Timer }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenCalledTimes(1);
+      clock = time(21, 0) + 15_000;
+      handler.update(timerDevice({ switchState: SwitchState.Off }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Timer);
+    });
+
+    it('plain off for a controller that never ran a schedule', async () => {
+      clock = time(12, 0);
+      const { on, accessory } = build(makeDevice({ switchState: SwitchState.Manual, ...schedule }));
+      expect(accessory.context.followsSchedule).toBeUndefined();
+      await on.handleSetRequest(false);
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Off);
+    });
+
+    it('survives a restart: the persisted context still restores the schedule', async () => {
+      clock = time(19, 30);
+      const first = build(timerDevice());
+      await first.on.handleSetRequest(false);
+
+      // New handler on the same (cached) accessory, as after a HOOBS restart.
+      clock = time(21, 5);
+      const second = build(timerDevice({ switchState: SwitchState.Off }), 'lightbulb', first.accessory);
+      second.handler.update(timerDevice({ switchState: SwitchState.Off }));
+      await flush();
+      expect(client.setSwitchState).toHaveBeenLastCalledWith('device-1', SwitchState.Timer);
     });
   });
 });
