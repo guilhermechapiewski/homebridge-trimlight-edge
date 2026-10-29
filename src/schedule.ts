@@ -7,7 +7,8 @@
  *
  * Ported from the MIT-licensed Home Assistant integration
  * https://github.com/Michael-Civitillo/trimlight-edge-ha (light.py), which
- * worked these rules out against real controllers.
+ * worked these rules out against real controllers. See NOTICE for its MIT
+ * license.
  */
 
 export interface ScheduleTime {

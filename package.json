@@ -5,6 +5,14 @@
   "description": "Homebridge plugin to control Trimlight Edge permanent lighting from Apple Home via the Trimlight cloud API.",
   "license": "ISC",
   "author": "Guilherme Chapiewski",
+  "homepage": "https://github.com/guilhermechapiewski/homebridge-trimlight-edge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guilhermechapiewski/homebridge-trimlight-edge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/guilhermechapiewski/homebridge-trimlight-edge/issues"
+  },
   "keywords": [
     "homebridge-plugin",
     "hoobs",
@@ -20,7 +28,9 @@
   "files": [
     "dist",
     "config.schema.json",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "build": "rimraf dist && tsc -p tsconfig.build.json",

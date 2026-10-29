@@ -12,6 +12,7 @@ A Homebridge plugin (`homebridge-trimlight-edge`) that exposes Trimlight Edge pe
 - **Commits:** commit verified, green states **directly to `main`** after each chunk of work, with messages explaining what changed and why. No feature branches for now.
 - **Ask first** before anything outward-facing: `git push`, `npm publish`, or anything else that leaves this machine.
 - **Never commit secrets.** Trimlight `clientId`/`clientSecret` are only passed via the `TRIMLIGHT_CLIENT_ID` / `TRIMLIGHT_CLIENT_SECRET` env vars, never written to files.
+- **Licensing:** the project is ISC (`LICENSE`). `src/schedule.ts` is ported from MIT-licensed code, whose notice lives in `NOTICE` and must ship in the package. Add to `NOTICE` whenever more code is ported.
 - Match the surrounding code style (TypeScript, single quotes, semicolons, trailing commas; see `eslint.config.mjs`).
 
 ## Commands
@@ -27,7 +28,7 @@ npm run build       # tsc -> dist/ (CommonJS, ES2020)
 node scripts/trimlight-cli.js list | raw | detail <id> | on <id> | off <id>
 ```
 
-`test:e2e` uses `HOMEBRIDGE_BIN` to target another Homebridge install. Before releasing, run it across the version matrix: Homebridge 1.3.4 and 1.5.0 on Node 16, and Homebridge 2.4.x on Node 22. Install those into a scratch directory with `npm install node@<v> homebridge@<v>` and run that node binary on `test/e2e/run-e2e.js`. Node 14 has no Apple Silicon build, so check ES2020 syntax with `npx acorn --ecma2020 dist/*.js` instead.
+Before publishing, also run the e2e against the packed artifact: `npm pack`, extract it, then set `E2E_PLUGIN_PATH=<extracted>/package` for `node test/e2e/run-e2e.js`. This catches files missing from `package.json` `files`. `test:e2e` uses `HOMEBRIDGE_BIN` to target another Homebridge install. Before releasing, run it across the version matrix: Homebridge 1.3.4 and 1.5.0 on Node 16, and Homebridge 2.4.x on Node 22. Install those into a scratch directory with `npm install node@<v> homebridge@<v>` and run that node binary on `test/e2e/run-e2e.js`. Node 14 has no Apple Silicon build, so check ES2020 syntax with `npx acorn --ecma2020 dist/*.js` instead.
 
 ## Compatibility constraints (HOOBS)
 

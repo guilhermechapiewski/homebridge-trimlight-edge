@@ -5,7 +5,8 @@
  * (insecure mode) exactly like the Home app would.
  *
  * Usage: npm run test:e2e
- * Set HOMEBRIDGE_BIN to test a different Homebridge install (e.g. v2).
+ * Set HOMEBRIDGE_BIN to test a different Homebridge install (e.g. v2), and
+ * E2E_PLUGIN_PATH to test an unpacked `npm pack` tarball instead of the repo.
  */
 const assert = require('assert');
 const { spawn } = require('child_process');
@@ -17,6 +18,7 @@ const path = require('path');
 const { createMockCloud } = require('./mockTrimlightCloud');
 
 const ROOT = path.resolve(__dirname, '..', '..');
+const PLUGIN_PATH = path.resolve(process.env.E2E_PLUGIN_PATH || ROOT);
 const HOMEBRIDGE_BIN = process.env.HOMEBRIDGE_BIN || path.join(ROOT, 'node_modules', 'homebridge', 'bin', 'homebridge');
 const PIN = '031-45-154';
 const CLIENT_ID = 'e2e-client';
@@ -123,7 +125,7 @@ async function readOn(port, aid, iid) {
 }
 
 async function main() {
-  assert.ok(fs.existsSync(path.join(ROOT, 'dist', 'index.js')), 'Run "npm run build" first');
+  assert.ok(fs.existsSync(path.join(PLUGIN_PATH, 'dist', 'index.js')), `No dist/index.js in ${PLUGIN_PATH}; run "npm run build" first`);
 
   const { server, state } = createMockCloud({
     clientId: CLIENT_ID,
@@ -138,7 +140,7 @@ async function main() {
   const pluginDir = path.join(tmp, 'plugins');
   fs.mkdirSync(storageDir);
   fs.mkdirSync(pluginDir);
-  fs.symlinkSync(ROOT, path.join(pluginDir, 'homebridge-trimlight-edge'));
+  fs.symlinkSync(PLUGIN_PATH, path.join(pluginDir, 'homebridge-trimlight-edge'));
 
   const hapPort = 50000 + Math.floor(Math.random() * 10000);
   fs.writeFileSync(path.join(storageDir, 'config.json'), JSON.stringify({
