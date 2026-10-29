@@ -65,6 +65,10 @@ function createMockCloud({ clientId, clientSecret, devices }) {
             name: device.name, switchState: device.switchState, connectivity: device.connectivity, state: device.state,
             colorOrder: 0, ic: 0, fwVersionName: '1.17.77', effects: [], combinedEffect: { effectIds: [], interval: 5 },
             daily: device.daily || [], calendar: device.calendar || [], currentEffect: {}, overlayEffects: [],
+            currentDatetime: (() => {
+              const d = new Date();
+              return { year: d.getFullYear() - 2000, month: d.getMonth() + 1, day: d.getDate(), weekday: d.getDay() + 1, hours: d.getHours(), minutes: d.getMinutes(), seconds: d.getSeconds() };
+            })(),
           },
         });
       }
