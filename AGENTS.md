@@ -70,6 +70,7 @@ HOOBS boxes run old runtimes, seen in the wild as Node 14–16 with Homebridge 1
 
 - Install route: **publish to npm**, then install from the HOOBS plugin search, or over SSH with `sudo hbs plugin add homebridge-trimlight-edge`. The plan is to put it in a separate HOOBS bridge for isolation.
 - Local-file installs don't work through HOOBS. Per the hoobsd source, `hbs plugin add` runs `yarn add <name>@<tag>` in `/var/lib/hoobs/<bridge>`. HOOBS loads only plugins listed in that folder's `package.json` dependencies that carry the `homebridge-plugin` keyword, and never loads global installs.
+- **The HOOBS UI depends on the HOOBS plugin directory** (`plugins.hoobs.org`), which mirrors npm on its own schedule. Until a newly published package is indexed (`https://plugins.hoobs.org/api/plugins?identifier=homebridge-trimlight-edge` returns `count: 0`), HOOBS still installs and runs the plugin, but the bridge page shows "0 plugins installed" with no settings form. The workaround is to edit the bridge config JSON directly at `/var/lib/hoobs/<bridge-id>.conf` (the owner's bridge id is `trimlight`), adding `clientId`/`clientSecret` to the `"platform": "TrimlightEdge"` entry, then restart the bridge. Logs are in `/var/lib/hoobs/hoobs.log`.
 - Credentials come from Trimlight: https://trimlight.com/support/does-the-edge-have-an-open-api
 
 ## Status (update as work lands)
